@@ -11,6 +11,9 @@
     <AssemblyName>RandVideoPlayer</AssemblyName>
     <RootNamespace>RandVideoPlayer</RootNamespace>
     <ApplicationIcon>app.ico</ApplicationIcon>
+    <Version>1.0.1</Version>
+    <AssemblyVersion>1.0.1.0</AssemblyVersion>
+    <FileVersion>1.0.1.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>

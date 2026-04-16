@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using RandVideoPlayer.AppState;
 using RandVideoPlayer.Controls;
 using RandVideoPlayer.Integrations;
@@ -171,6 +172,24 @@ public sealed class MainForm : Form
             BeginInvoke(new Action(() => _playback.TogglePause()));
         };
         _mouseHook.Install();
+
+        // Recover from system suspend/resume. Sleep can leave libvlc's D3D
+        // video output in a broken state (black video) and/or bound to a
+        // stale audio endpoint. On resume, re-issue playback on the current
+        // file so libvlc rebuilds its video/audio pipeline. SystemEvents
+        // fires on a non-UI thread, so marshal back before touching UI state.
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
+    }
+
+    private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode != PowerModes.Resume) return;
+        if (IsDisposed || !IsHandleCreated) return;
+        if (_currentFullPath == null) return;
+        // ReinitializeAfterResume itself enqueues the work on the playback
+        // worker thread, so this just needs to hop to the UI thread first
+        // to read _currentFullPath / Player.Time safely.
+        try { BeginInvoke(new Action(() => { try { _playback.ReinitializeAfterResume(); } catch { } })); } catch { }
     }
 
     // True when the window under the given screen point has our form as its
@@ -755,6 +774,7 @@ public sealed class MainForm : Form
             _settings.Save();
         }
         catch { }
+        try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
         try { _mouseHook.Dispose(); } catch { }
         try { _durations?.Dispose(); } catch { }
         try { _playback.Dispose(); } catch { }
