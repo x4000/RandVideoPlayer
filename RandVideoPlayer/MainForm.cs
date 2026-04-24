@@ -62,6 +62,10 @@ public sealed class MainForm : Form
         _playback.MediaEnded += OnMediaEnded;
         _playback.MediaFailed += OnMediaFailed;
         _playback.StateChanged += OnPlaybackStateChanged;
+        // After a full pipeline recycle the old Player has been disposed and
+        // replaced — the VideoView has to be rebound to the new instance
+        // before the next Play call, or video paints into nothing.
+        _playback.PipelineRecycled += () => _playback.AttachTo(_videoHost.VideoView);
 
         _menu = new MenuStrip();
         var fileMenu = new ToolStripMenuItem("&File");
@@ -77,7 +81,14 @@ public sealed class MainForm : Form
         var plMenu = new ToolStripMenuItem("&Playlist");
         var reshuffleItem = new ToolStripMenuItem("&Reshuffle Now", null, (_, __) => ReshuffleWithConfirm());
         plMenu.DropDownItems.Add(reshuffleItem);
-        _menu.Items.AddRange(new ToolStripItem[] { fileMenu, viewMenu, plMenu });
+
+        var playerMenu = new ToolStripMenuItem("Play&er");
+        var resetPlayerItem = new ToolStripMenuItem("&Reset Player",
+            null, (_, __) => ResetPlayer())
+        { ToolTipText = "Rebuild the video/audio pipeline. Use if video or audio stops working after the machine has been idle." };
+        playerMenu.DropDownItems.Add(resetPlayerItem);
+
+        _menu.Items.AddRange(new ToolStripItem[] { fileMenu, viewMenu, plMenu, playerMenu });
 
         _videoHost = new VideoHost();
         _playback.AttachTo(_videoHost.VideoView);
@@ -523,13 +534,38 @@ public sealed class MainForm : Form
         if (r != DialogResult.OK) return;
 
         bool isPlaying = string.Equals(_currentFullPath, fullPath, StringComparison.OrdinalIgnoreCase);
-        if (isPlaying) { try { _playback.Stop(); } catch { } }
-
-        if (!ShellOps.SendToRecycleBin(fullPath))
+        if (isPlaying)
         {
-            _errorPanel.Log("Recycle Bin delete failed: " + fullPath);
-            return;
+            // Move playback off the doomed file first — libvlc keeps an open
+            // file handle on whatever it's playing, and SHFileOperation will
+            // block the UI thread indefinitely waiting on that handle. The
+            // atomic Player.Play swap inside GoNext is what releases the old
+            // media; Stop alone can race because it's enqueued on a worker.
+            if (_shuffle != null && _shuffle.Files.Count > 1)
+            {
+                GoNext();
+            }
+            else
+            {
+                try { _playback.Stop(); } catch { }
+                _currentFullPath = null;
+                UpdateNowPlayingLabel();
+                UpdateWindowTitle();
+            }
+            // The play/stop was enqueued on the VLC worker; defer the recycle
+            // until that queued work has actually finished executing.
+            _playback.RunAfterPendingWork(() => PerformRecycle(fullPath));
         }
+        else
+        {
+            PerformRecycle(fullPath);
+        }
+    }
+
+    private void PerformRecycle(string fullPath)
+    {
+        if (!ShellOps.SendToRecycleBin(fullPath))
+            _errorPanel.Log("Recycle Bin delete failed: " + fullPath);
     }
 
     private void SavePositionState(bool withPositionMs)
@@ -563,12 +599,12 @@ public sealed class MainForm : Form
         if (_sidebar.Mode == Sidebar.ViewMode.ShuffleOrder)
         {
             entries = _shuffle.Files.Select((rel, i) =>
-                ((i + 1).ToString("N0"), rel, _library.ToFull(rel)));
+                ((i + 1).ToString(), rel, _library.ToFull(rel)));
         }
         else
         {
             entries = _library.AlphaRelative().Select((rel, i) =>
-                ((i + 1).ToString("N0"), rel, _library.ToFull(rel)));
+                ((i + 1).ToString(), rel, _library.ToFull(rel)));
         }
         _sidebar.SetItems(entries, _currentFullPath);
     }
@@ -590,6 +626,17 @@ public sealed class MainForm : Form
             Text = $"RandVideoPlayer — {_library.RootFolder}";
         else
             Text = "RandVideoPlayer";
+    }
+
+    private void ResetPlayer()
+    {
+        // Full pipeline rebuild. The PlaybackController.Recycle call disposes
+        // the current MediaPlayer and LibVLC, creates fresh ones, fires
+        // PipelineRecycled (which we use to reattach the VideoView), and then
+        // replays the current file at its current playhead position.
+        _errorPanel.Log("Player reset: rebuilding video/audio pipeline.");
+        try { _playback.Recycle(); }
+        catch (Exception ex) { _errorPanel.Log("Player reset failed: " + ex.Message); }
     }
 
     private void ToggleSidebar() { _sidebar.Visible = !_sidebar.Visible; _settings.SidebarVisible = _sidebar.Visible; }

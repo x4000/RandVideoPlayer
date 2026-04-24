@@ -9,13 +9,19 @@ namespace RandVideoPlayer.Playback;
 
 public sealed class PlaybackController : IDisposable
 {
-    private readonly LibVLC _libVlc;
+    private LibVLC _libVlc;
     public LibVLC LibVlcInstance => _libVlc;
-    public MediaPlayer Player { get; }
+    public MediaPlayer Player { get; private set; }
 
     public event Action? MediaEnded;
     public event Action<string>? MediaFailed;
     public event Action? StateChanged;
+    /// <summary>
+    /// Fired on the UI thread after <see cref="Recycle"/> has rebuilt both
+    /// LibVLC and MediaPlayer. The host must reattach its VideoView to the
+    /// new <see cref="Player"/> instance — the old one has been disposed.
+    /// </summary>
+    public event Action? PipelineRecycled;
 
     private System.Windows.Forms.Timer? _watchdog;
     private string? _currentPath;
@@ -46,18 +52,7 @@ public sealed class PlaybackController : IDisposable
         Core.Initialize();
         _libVlc = new LibVLC("--no-video-title-show");
         Player = new MediaPlayer(_libVlc);
-
-        Player.EndReached += (_, __) => RunOnUi(() => MediaEnded?.Invoke());
-        Player.EncounteredError += (_, __) =>
-            RunOnUi(() => MediaFailed?.Invoke("VLC EncounteredError on " + (_currentPath ?? "?")));
-        Player.Playing += (_, __) =>
-        {
-            _sawPlaying = true;
-            RunOnUi(() => { ReapplyAudio(); StateChanged?.Invoke(); });
-        };
-        Player.Paused += (_, __) => RunOnUi(() => StateChanged?.Invoke());
-        Player.Stopped += (_, __) => RunOnUi(() => StateChanged?.Invoke());
-        Player.TimeChanged += (_, __) => RunOnUi(() => StateChanged?.Invoke());
+        WirePlayerEvents(Player);
 
         _worker = new Thread(WorkerLoop)
         {
@@ -65,6 +60,21 @@ public sealed class PlaybackController : IDisposable
             Name = "RVP-VLC-Worker"
         };
         _worker.Start();
+    }
+
+    private void WirePlayerEvents(MediaPlayer p)
+    {
+        p.EndReached += (_, __) => RunOnUi(() => MediaEnded?.Invoke());
+        p.EncounteredError += (_, __) =>
+            RunOnUi(() => MediaFailed?.Invoke("VLC EncounteredError on " + (_currentPath ?? "?")));
+        p.Playing += (_, __) =>
+        {
+            _sawPlaying = true;
+            RunOnUi(() => { ReapplyAudio(); StateChanged?.Invoke(); });
+        };
+        p.Paused += (_, __) => RunOnUi(() => StateChanged?.Invoke());
+        p.Stopped += (_, __) => RunOnUi(() => StateChanged?.Invoke());
+        p.TimeChanged += (_, __) => RunOnUi(() => StateChanged?.Invoke());
     }
 
     private void WorkerLoop()
@@ -193,6 +203,62 @@ public sealed class PlaybackController : IDisposable
         });
     }
 
+    /// <summary>
+    /// Full teardown and rebuild of the libvlc pipeline — disposes the
+    /// current MediaPlayer *and* LibVLC instance and creates fresh ones.
+    /// Use when the lighter <see cref="ReinitializeAfterResume"/> isn't
+    /// enough (e.g. after a very long idle, a monitor-only sleep that never
+    /// fires PowerModes.Resume, or a GPU device loss that leaves audio AND
+    /// video unable to recover via replay alone). The host must listen for
+    /// <see cref="PipelineRecycled"/> and reattach its VideoView to the new
+    /// <see cref="Player"/>. If a file was loaded, it is restarted at the
+    /// playhead position captured before teardown.
+    /// </summary>
+    public void Recycle()
+    {
+        var path = _currentPath;
+        long resumeMs = 0;
+        try { resumeMs = Player.Time; } catch { }
+
+        EnqueueWork(() =>
+        {
+            var oldPlayer = Player;
+            var oldLibVlc = _libVlc;
+            var oldMedia = _currentMedia;
+            _currentMedia = null;
+            _sawPlaying = false;
+
+            try { oldPlayer.Stop(); } catch { }
+            try { oldMedia?.Dispose(); } catch { }
+            try { oldPlayer.Dispose(); } catch { }
+            try { oldLibVlc.Dispose(); } catch { }
+
+            try
+            {
+                _libVlc = new LibVLC("--no-video-title-show");
+                var newPlayer = new MediaPlayer(_libVlc);
+                WirePlayerEvents(newPlayer);
+                Player = newPlayer;
+            }
+            catch (Exception ex)
+            {
+                RunOnUi(() => MediaFailed?.Invoke("Pipeline recycle failed: " + ex.Message));
+                return;
+            }
+
+            // Host must reattach VideoView to the new Player before we start
+            // the file, otherwise the video surface will paint into nothing.
+            RunOnUi(() =>
+            {
+                try { PipelineRecycled?.Invoke(); } catch { }
+                try { Player.Volume = _desiredVolume; } catch { }
+                try { Player.Mute = _desiredMuted; } catch { }
+                if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                    PlayAt(path, resumeMs);
+            });
+        });
+    }
+
     // Some backends ignore volume writes while muted, so always unmute first,
     // set volume, then re-assert the desired mute state.
     private void ReapplyAudio()
@@ -229,6 +295,18 @@ public sealed class PlaybackController : IDisposable
         // Route through the worker — Player.Stop() can block if the video
         // output is wedged.
         EnqueueWork(() => { try { Player.Stop(); } catch { } });
+    }
+
+    /// <summary>
+    /// Runs <paramref name="uiCallback"/> on the UI thread after any
+    /// currently-queued worker operations (Play, Stop, ReinitializeAfterResume)
+    /// have finished. Use this to coordinate UI actions that need libvlc to
+    /// have released its file handle — e.g. deleting the file that was just
+    /// stopped, where SHFileOperation would otherwise hang on the open handle.
+    /// </summary>
+    public void RunAfterPendingWork(Action uiCallback)
+    {
+        EnqueueWork(() => RunOnUi(uiCallback));
     }
 
     public long LengthMs => Player.Length;
