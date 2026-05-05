@@ -116,8 +116,16 @@ public sealed class MainForm : Form
         _transport.SetMuteGlyph(false);
 
         _transport.PlayPauseBtn.Click += (_, __) => { _playback.TogglePause(); };
-        _transport.PrevBtn.Click += (_, __) => GoPrev();
-        _transport.NextBtn.Click += (_, __) => GoNext();
+        _transport.PrevBtn.Click += (_, __) =>
+        {
+            if ((Control.ModifierKeys & Keys.Control) == Keys.Control) JumpByApproxHour(forward: false);
+            else GoPrev();
+        };
+        _transport.NextBtn.Click += (_, __) =>
+        {
+            if ((Control.ModifierKeys & Keys.Control) == Keys.Control) JumpByApproxHour(forward: true);
+            else GoNext();
+        };
         _transport.ReshuffleBtn.Click += (_, __) => ReshuffleWithConfirm();
         _transport.SidebarBtn.Click += (_, __) => ToggleSidebar();
         _transport.ErrorPanelBtn.Click += (_, __) =>
@@ -451,6 +459,52 @@ public sealed class MainForm : Form
         {
             ReshuffleInternal(antiRepeat: true, playFirst: true);
         }
+    }
+
+    // Ctrl+click on Prev/Next: jump to the song boundary closest to ~1 hour
+    // away (in either direction), measured by accumulated cached durations.
+    // Songs whose duration hasn't been scanned yet count as 0, so during the
+    // initial scan this can land further than expected.
+    private void JumpByApproxHour(bool forward)
+    {
+        if (_shuffle == null || _library == null || _durations == null) return;
+        if (_shuffle.Files.Count == 0 || _currentIndex < 0) return;
+
+        const long ONE_HOUR_MS = 60L * 60L * 1000L;
+        long DurAt(int i) => _durations.GetDurationMs(_library.ToFull(_shuffle.Files[i]));
+
+        int n = _shuffle.Files.Count;
+        int target = -1;
+        long bestDiff = long.MaxValue;
+        long cumulative = 0;
+
+        if (forward)
+        {
+            // Cumulative = offset from start of current song to start of song t.
+            for (int t = _currentIndex + 1; t < n; t++)
+            {
+                cumulative += DurAt(t - 1);
+                long diff = Math.Abs(cumulative - ONE_HOUR_MS);
+                if (target < 0 || diff < bestDiff) { bestDiff = diff; target = t; }
+                if (cumulative >= ONE_HOUR_MS) break;
+            }
+        }
+        else
+        {
+            // Cumulative = sum of durations of songs t..currentIndex-1 (rewound time).
+            for (int t = _currentIndex - 1; t >= 0; t--)
+            {
+                cumulative += DurAt(t);
+                long diff = Math.Abs(cumulative - ONE_HOUR_MS);
+                if (target < 0 || diff < bestDiff) { bestDiff = diff; target = t; }
+                if (cumulative >= ONE_HOUR_MS) break;
+            }
+        }
+
+        if (target < 0) { SystemSounds.Beep(); return; }
+        _currentIndex = target;
+        _currentFullPath = _library.ToFull(_shuffle.Files[_currentIndex]);
+        PlayPath(_currentFullPath, saveState: true);
     }
 
     private void OnMediaEnded()

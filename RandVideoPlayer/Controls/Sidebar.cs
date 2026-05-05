@@ -47,7 +47,7 @@ public sealed class Sidebar : UserControl, IThemedControl
         // Tabs header
         var tabs = new Panel { Dock = DockStyle.Top, Height = 34 };
         AlphaBtn = MakeTabButton("Alphabetical");
-        ShuffleBtn = MakeTabButton("Shuffle Order");
+        ShuffleBtn = MakeTabButton("Shuffled List");
         AlphaBtn.Dock = DockStyle.Left;
         ShuffleBtn.Dock = DockStyle.Left;
         AlphaBtn.Click += (_, __) => Mode = ViewMode.Alphabetical;

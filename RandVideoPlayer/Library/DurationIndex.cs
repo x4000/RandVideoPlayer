@@ -69,6 +69,11 @@ public sealed class DurationIndex : IDisposable
         _worker = Task.Run(() => ScanLoop(fullPaths, token), token);
     }
 
+    public long GetDurationMs(string fullPath)
+    {
+        return _cache.TryGetValue(fullPath, out var e) ? e.DurationMs : 0;
+    }
+
     public void Cancel()
     {
         try { _cts?.Cancel(); } catch { }

@@ -59,9 +59,9 @@ public sealed class TransportBar : UserControl, IThemedControl
         row1.Controls.Add(Scrubber, 1, 0);
         row1.Controls.Add(TotalLabel, 2, 0);
 
-        PrevBtn = new IconButton(GLYPH_PREV, "Previous (Mouse 4)");
+        PrevBtn = new IconButton(GLYPH_PREV, "Previous (Mouse 4)\nCtrl+click: jump back ~1 hour");
         PlayPauseBtn = new IconButton(GLYPH_PLAY, "Play / Pause (Space)");
-        NextBtn = new IconButton(GLYPH_NEXT, "Next (Mouse 5)");
+        NextBtn = new IconButton(GLYPH_NEXT, "Next (Mouse 5)\nCtrl+click: jump forward ~1 hour");
         ReshuffleBtn = new IconButton(GLYPH_SHUFFLE, "Reshuffle playlist");
         SidebarBtn = new IconButton(GLYPH_LIST, "Toggle sidebar (F9)");
         ErrorPanelBtn = new IconButton(GLYPH_ERROR, "Toggle error panel");
