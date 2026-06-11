@@ -4,6 +4,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using RandVideoPlayer.AppState;
@@ -45,6 +46,17 @@ public sealed class MainForm : Form
 
     private Theme _theme = Theme.Dark;
     private readonly ThreadMouseHook _mouseHook = new();
+
+    // Display power-state recovery. When the monitors power off (idle timeout
+    // or the panel dropping its DP/HDMI link) while the PC stays awake, the GPU
+    // can lose the Direct3D device libvlc renders into — black video, audio
+    // fine. No system suspend happens, so PowerModes.Resume never fires. We
+    // instead listen for the display turning off and back on and rebuild the
+    // pipeline automatically the moment it returns.
+    private IntPtr _displayNotify = IntPtr.Zero;
+    private bool _displayWasOff;
+    private int _lastScreenCount = -1;
+    private System.Windows.Forms.Timer? _displayRecoveryTimer;
 
     public MainForm(AppSettings settings)
     {
@@ -739,6 +751,119 @@ public sealed class MainForm : Form
     {
         base.OnHandleCreated(e);
         DarkChrome.ApplyTitleBar(Handle, _theme.IsDark);
+
+        // Ask Windows to tell us when the console display turns off/on so we can
+        // auto-rebuild the video pipeline after the monitors come back.
+        if (_displayNotify == IntPtr.Zero)
+        {
+            try
+            {
+                var guid = Win32.GUID_CONSOLE_DISPLAY_STATE;
+                _displayNotify = Win32.RegisterPowerSettingNotification(
+                    Handle, ref guid, Win32.DEVICE_NOTIFY_WINDOW_HANDLE);
+            }
+            catch { }
+        }
+        _lastScreenCount = SafeScreenCount();
+    }
+
+    protected override void OnHandleDestroyed(EventArgs e)
+    {
+        UnregisterDisplayNotify();
+        base.OnHandleDestroyed(e);
+    }
+
+    private void UnregisterDisplayNotify()
+    {
+        if (_displayNotify != IntPtr.Zero)
+        {
+            try { Win32.UnregisterPowerSettingNotification(_displayNotify); } catch { }
+            _displayNotify = IntPtr.Zero;
+        }
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        switch (m.Msg)
+        {
+            case Win32.WM_POWERBROADCAST:
+                if ((int)m.WParam == Win32.PBT_POWERSETTINGCHANGE && m.LParam != IntPtr.Zero)
+                {
+                    try
+                    {
+                        var s = Marshal.PtrToStructure<Win32.POWERBROADCAST_SETTING>(m.LParam);
+                        if (s.PowerSetting == Win32.GUID_CONSOLE_DISPLAY_STATE)
+                            OnConsoleDisplayState(s.Data); // 0 = off, 1 = on, 2 = dimmed
+                    }
+                    catch { }
+                }
+                break;
+            case Win32.WM_DISPLAYCHANGE:
+                OnDisplayTopologyChanged();
+                break;
+        }
+        base.WndProc(ref m);
+    }
+
+    // The OS turned the display off (idle "turn off display after N min") and
+    // later back on, all while the PC stayed awake. This is the exact case
+    // PowerModes.Resume misses.
+    private void OnConsoleDisplayState(byte state)
+    {
+        if (state == 0) _displayWasOff = true;            // off
+        else if (state == 1 && _displayWasOff)            // on, after having been off
+        {
+            _displayWasOff = false;
+            ScheduleDisplayRecovery();
+        }
+    }
+
+    // Resolution/topology change. A monitor dropping or restoring its link
+    // (common when physically powered off, especially over DisplayPort) shows
+    // up here even when the console-display-state notification doesn't fire.
+    // We recover if we'd already seen an "off", or if a monitor reappeared.
+    private void OnDisplayTopologyChanged()
+    {
+        int now = SafeScreenCount();
+        bool monitorReturned = _lastScreenCount >= 0 && now > _lastScreenCount;
+        _lastScreenCount = now;
+        if (_displayWasOff || monitorReturned)
+        {
+            _displayWasOff = false;
+            ScheduleDisplayRecovery();
+        }
+    }
+
+    private static int SafeScreenCount()
+    {
+        try { return Screen.AllScreens.Length; } catch { return 1; }
+    }
+
+    // Debounce: coalesce the burst of power/display messages that arrive when
+    // displays wake, and give the GPU a moment to settle before rebuilding.
+    private void ScheduleDisplayRecovery()
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        if (_displayRecoveryTimer == null)
+        {
+            _displayRecoveryTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+            _displayRecoveryTimer.Tick += (_, __) =>
+            {
+                _displayRecoveryTimer!.Stop();
+                DoDisplayRecovery();
+            };
+        }
+        _displayRecoveryTimer.Stop();
+        _displayRecoveryTimer.Start();
+    }
+
+    private void DoDisplayRecovery()
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        if (_currentFullPath == null) return; // nothing loaded — nothing to rebuild
+        _errorPanel.Log("Display returned from power-off — rebuilding video pipeline.");
+        try { _playback.Recycle(); }
+        catch (Exception ex) { _errorPanel.Log("Auto display-recovery failed: " + ex.Message); }
     }
 
     private void RebuildRecentMenu()
@@ -876,6 +1001,8 @@ public sealed class MainForm : Form
         }
         catch { }
         try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
+        try { UnregisterDisplayNotify(); } catch { }
+        try { _displayRecoveryTimer?.Stop(); _displayRecoveryTimer?.Dispose(); } catch { }
         try { _mouseHook.Dispose(); } catch { }
         try { _durations?.Dispose(); } catch { }
         try { _playback.Dispose(); } catch { }
@@ -942,8 +1069,26 @@ internal static class Win32
 {
     public const uint GA_ROOT = 2;
 
+    // Display power-state notifications.
+    public const int WM_DISPLAYCHANGE = 0x007E;
+    public const int WM_POWERBROADCAST = 0x0218;
+    public const int PBT_POWERSETTINGCHANGE = 0x8013;
+    public const int DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
+    // GUID_CONSOLE_DISPLAY_STATE — fires when the console display turns
+    // off (0), on (1), or dims (2), even though the system never sleeps.
+    public static readonly Guid GUID_CONSOLE_DISPLAY_STATE =
+        new Guid("6fe69556-704a-47a0-8f24-c28d936fda47");
+
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     public struct POINT { public int x, y; }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 4)]
+    public struct POWERBROADCAST_SETTING
+    {
+        public Guid PowerSetting;
+        public uint DataLength;
+        public byte Data; // first byte of the payload; for display-state it's 0/1/2
+    }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern IntPtr WindowFromPoint(POINT pt);
@@ -953,4 +1098,12 @@ internal static class Win32
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern bool GetCursorPos(out POINT pt);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr RegisterPowerSettingNotification(
+        IntPtr hRecipient, ref Guid PowerSettingGuid, int Flags);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    public static extern bool UnregisterPowerSettingNotification(IntPtr handle);
 }

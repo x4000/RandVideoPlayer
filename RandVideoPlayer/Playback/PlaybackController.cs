@@ -30,6 +30,19 @@ public sealed class PlaybackController : IDisposable
     private bool _desiredMuted;
     private Media? _currentMedia;
 
+    // Cached playback status, updated only from libvlc events (which fire on
+    // libvlc's own thread). The UI thread reads THESE instead of calling
+    // Player.Time / Player.Length / Player.State directly. Those property reads
+    // take libvlc's player lock, which can be held for seconds — or deadlock
+    // against a cross-thread video-window rebuild — while the Direct3D output
+    // is wedged after a monitor power-off. The 250ms UI status timer hitting
+    // Player.Time was exactly what froze the whole app when "Next" was pressed
+    // on a black-screened pipeline. Reading cached values keeps the UI thread
+    // completely decoupled from libvlc's internal locks.
+    private long _cachedTimeMs;
+    private long _cachedLengthMs;
+    private volatile VLCState _cachedState = VLCState.NothingSpecial;
+
     // Captured at construction on the UI thread. All callbacks libvlc fires
     // on its own event thread are marshaled here before touching MediaPlayer
     // state. Without this, rapid track changes can deadlock: UI thread inside
@@ -64,17 +77,29 @@ public sealed class PlaybackController : IDisposable
 
     private void WirePlayerEvents(MediaPlayer p)
     {
-        p.EndReached += (_, __) => RunOnUi(() => MediaEnded?.Invoke());
+        p.EndReached += (_, __) => { _cachedState = VLCState.Ended; RunOnUi(() => MediaEnded?.Invoke()); };
         p.EncounteredError += (_, __) =>
+        {
+            _cachedState = VLCState.Error;
             RunOnUi(() => MediaFailed?.Invoke("VLC EncounteredError on " + (_currentPath ?? "?")));
+        };
         p.Playing += (_, __) =>
         {
+            _cachedState = VLCState.Playing;
             _sawPlaying = true;
-            RunOnUi(() => { ReapplyAudio(); StateChanged?.Invoke(); });
+            // Reapply audio on the WORKER, not the UI thread — Player.Mute/
+            // Volume take the same player lock as everything else.
+            EnqueueWork(ReapplyAudio);
+            RunOnUi(() => StateChanged?.Invoke());
         };
-        p.Paused += (_, __) => RunOnUi(() => StateChanged?.Invoke());
-        p.Stopped += (_, __) => RunOnUi(() => StateChanged?.Invoke());
-        p.TimeChanged += (_, __) => RunOnUi(() => StateChanged?.Invoke());
+        p.Paused += (_, __) => { _cachedState = VLCState.Paused; RunOnUi(() => StateChanged?.Invoke()); };
+        p.Stopped += (_, __) => { _cachedState = VLCState.Stopped; RunOnUi(() => StateChanged?.Invoke()); };
+        p.TimeChanged += (_, e) =>
+        {
+            Interlocked.Exchange(ref _cachedTimeMs, e.Time);
+            RunOnUi(() => StateChanged?.Invoke());
+        };
+        p.LengthChanged += (_, e) => Interlocked.Exchange(ref _cachedLengthMs, e.Length);
     }
 
     private void WorkerLoop()
@@ -117,6 +142,10 @@ public sealed class PlaybackController : IDisposable
         // Capture desired starting point synchronously, do the slow work async.
         _currentPath = fullPath;
         _sawPlaying = false;
+        // Reset cached status now so the scrubber/labels don't briefly show the
+        // previous track's position while the new media's events catch up.
+        Interlocked.Exchange(ref _cachedTimeMs, Math.Max(0, startMs));
+        Interlocked.Exchange(ref _cachedLengthMs, 0);
         if (!File.Exists(fullPath))
         {
             MediaFailed?.Invoke("File not found: " + fullPath);
@@ -174,11 +203,9 @@ public sealed class PlaybackController : IDisposable
     {
         var path = _currentPath;
         if (string.IsNullOrEmpty(path)) return;
-        // Best-effort capture of current playhead from the UI thread before
-        // handing off. Reading Player.Time from here is fine — it's a quick
-        // property read that doesn't take the play/stop lock.
-        long resumeMs = 0;
-        try { resumeMs = Player.Time; } catch { }
+        // Use the cached playhead — never read Player.Time from the UI thread,
+        // since libvlc may be wedged (which is the whole reason we're resuming).
+        long resumeMs = Interlocked.Read(ref _cachedTimeMs);
 
         EnqueueWork(() =>
         {
@@ -217,8 +244,7 @@ public sealed class PlaybackController : IDisposable
     public void Recycle()
     {
         var path = _currentPath;
-        long resumeMs = 0;
-        try { resumeMs = Player.Time; } catch { }
+        long resumeMs = Interlocked.Read(ref _cachedTimeMs);
 
         EnqueueWork(() =>
         {
@@ -227,6 +253,9 @@ public sealed class PlaybackController : IDisposable
             var oldMedia = _currentMedia;
             _currentMedia = null;
             _sawPlaying = false;
+            _cachedState = VLCState.NothingSpecial;
+            Interlocked.Exchange(ref _cachedTimeMs, resumeMs);
+            Interlocked.Exchange(ref _cachedLengthMs, 0);
 
             try { oldPlayer.Stop(); } catch { }
             try { oldMedia?.Dispose(); } catch { }
@@ -248,11 +277,13 @@ public sealed class PlaybackController : IDisposable
 
             // Host must reattach VideoView to the new Player before we start
             // the file, otherwise the video surface will paint into nothing.
+            // Audio (Volume/Mute) is reapplied by ReapplyAudio inside the
+            // PlayAt -> PlayOnWorker path below, so we don't touch Player.* on
+            // the UI thread here. The only UI-thread work is rebinding the
+            // VideoView to the freshly created Player.
             RunOnUi(() =>
             {
                 try { PipelineRecycled?.Invoke(); } catch { }
-                try { Player.Volume = _desiredVolume; } catch { }
-                try { Player.Mute = _desiredMuted; } catch { }
                 if (!string.IsNullOrEmpty(path) && File.Exists(path))
                     PlayAt(path, resumeMs);
             });
@@ -284,9 +315,12 @@ public sealed class PlaybackController : IDisposable
 
     public void TogglePause()
     {
-        // Pause / unpause are fast and safe to call directly on the UI thread.
-        if (Player.State == VLCState.Playing) Player.Pause();
-        else if (Player.State == VLCState.Paused) Player.SetPause(false);
+        // Decide from cached state (no UI-thread libvlc read) and run the
+        // actual pause/unpause on the worker, so a wedged pipeline can never
+        // block the UI thread here.
+        var st = _cachedState;
+        if (st == VLCState.Playing) EnqueueWork(() => { try { Player.Pause(); } catch { } });
+        else if (st == VLCState.Paused) EnqueueWork(() => { try { Player.SetPause(false); } catch { } });
         else if (!string.IsNullOrEmpty(_currentPath) && File.Exists(_currentPath)) Play(_currentPath);
     }
 
@@ -309,11 +343,19 @@ public sealed class PlaybackController : IDisposable
         EnqueueWork(() => RunOnUi(uiCallback));
     }
 
-    public long LengthMs => Player.Length;
+    // All of these read cached state (updated from libvlc events) and route
+    // writes through the worker — the UI thread never calls into libvlc here.
+    public long LengthMs => Interlocked.Read(ref _cachedLengthMs);
     public long TimeMs
     {
-        get => Player.Time;
-        set { if (Player.IsSeekable) Player.Time = value; }
+        get => Interlocked.Read(ref _cachedTimeMs);
+        set
+        {
+            long target = Math.Max(0, value);
+            // Reflect the seek immediately in the UI, then apply it on the worker.
+            Interlocked.Exchange(ref _cachedTimeMs, target);
+            EnqueueWork(() => { try { if (Player.IsSeekable) Player.Time = target; } catch { } });
+        }
     }
 
     public int Volume
@@ -322,7 +364,8 @@ public sealed class PlaybackController : IDisposable
         set
         {
             _desiredVolume = Math.Clamp(value, 0, 150);
-            try { Player.Volume = _desiredVolume; } catch { }
+            int v = _desiredVolume;
+            EnqueueWork(() => { try { Player.Volume = v; } catch { } });
         }
     }
 
@@ -332,11 +375,11 @@ public sealed class PlaybackController : IDisposable
         set
         {
             _desiredMuted = value;
-            try { Player.Mute = value; } catch { }
+            EnqueueWork(() => { try { Player.Mute = value; } catch { } });
         }
     }
 
-    public bool IsPlaying => Player.State == VLCState.Playing;
+    public bool IsPlaying => _cachedState == VLCState.Playing;
 
     public void Dispose()
     {
