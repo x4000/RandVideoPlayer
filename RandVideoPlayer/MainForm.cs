@@ -19,7 +19,10 @@ namespace RandVideoPlayer;
 public sealed class MainForm : Form
 {
     private readonly AppSettings _settings;
-    private readonly PlaybackController _playback;
+    // Not readonly: when the engine wedges beyond recovery (a libvlc call on
+    // the worker that never returns) it is abandoned wholesale and replaced —
+    // see RebuildPlaybackEngine.
+    private PlaybackController _playback;
 
     private readonly MenuStrip _menu;
     private readonly ToolStripMenuItem _recentMenu;
@@ -58,6 +61,18 @@ public sealed class MainForm : Form
     private int _lastScreenCount = -1;
     private System.Windows.Forms.Timer? _displayRecoveryTimer;
 
+    // Engine-wedge watchdog. A libvlc call that never returns (Stop/Play/
+    // Dispose against a video output whose D3D device died) permanently
+    // starves the worker queue: the window stays responsive but every
+    // Play/Pause/Next silently does nothing. Detection + full engine swap is
+    // the only way out — the in-process equivalent of restarting the app.
+    private System.Windows.Forms.Timer? _engineWatchdog;
+    private long _lastEngineRebuildTicks;
+    private int _consecutiveEngineRebuilds; // reset whenever playback actually reaches Playing
+    private const int EngineWedgeThresholdMs = 10_000;   // generous: HDD spin-up on a Play can take seconds
+    private const int EngineRebuildMinIntervalMs = 60_000; // never thrash rebuilds in a loop
+    private const int MaxConsecutiveEngineRebuilds = 5;  // each abandoned engine leaks; bound the damage
+
     public MainForm(AppSettings settings)
     {
         _settings = settings;
@@ -71,13 +86,7 @@ public sealed class MainForm : Form
         TryLoadAppIcon();
 
         _playback = new PlaybackController();
-        _playback.MediaEnded += OnMediaEnded;
-        _playback.MediaFailed += OnMediaFailed;
-        _playback.StateChanged += OnPlaybackStateChanged;
-        // After a full pipeline recycle the old Player has been disposed and
-        // replaced — the VideoView has to be rebound to the new instance
-        // before the next Play call, or video paints into nothing.
-        _playback.PipelineRecycled += () => _playback.AttachTo(_videoHost.VideoView);
+        WirePlayback(_playback);
 
         _menu = new MenuStrip();
         var fileMenu = new ToolStripMenuItem("&File");
@@ -179,6 +188,21 @@ public sealed class MainForm : Form
         _positionSaveTimer = new System.Windows.Forms.Timer { Interval = 5000 };
         _positionSaveTimer.Tick += (_, __) => SavePositionState(withPositionMs: false);
 
+        _engineWatchdog = new System.Windows.Forms.Timer { Interval = 2000 };
+        _engineWatchdog.Tick += (_, __) =>
+        {
+            if (!_playback.WorkerLooksWedged(EngineWedgeThresholdMs)) return;
+            // While the display is off a wedged worker bothers nobody, and a
+            // rebuild attempted mid-transition could just wedge again. Wait
+            // for the display to return; DoDisplayRecovery handles it then.
+            if (_displayWasOff) return;
+            // If rebuilds keep failing to produce actual playback, stop —
+            // each abandoned engine leaks, and something deeper is wrong.
+            if (_consecutiveEngineRebuilds >= MaxConsecutiveEngineRebuilds) return;
+            RebuildPlaybackEngine("a playback call has been stuck for over 10 seconds");
+        };
+        _engineWatchdog.Start();
+
         FormClosing += OnFormClosing;
         RebuildRecentMenu();
 
@@ -216,11 +240,79 @@ public sealed class MainForm : Form
     {
         if (e.Mode != PowerModes.Resume) return;
         if (IsDisposed || !IsHandleCreated) return;
-        if (_currentFullPath == null) return;
-        // ReinitializeAfterResume itself enqueues the work on the playback
-        // worker thread, so this just needs to hop to the UI thread first
-        // to read _currentFullPath / Player.Time safely.
-        try { BeginInvoke(new Action(() => { try { _playback.ReinitializeAfterResume(); } catch { } })); } catch { }
+        // True suspend/resume takes the same debounced recovery path as a
+        // display power-on — one coalesced pipeline rebuild once things have
+        // settled. SystemEvents fires on a non-UI thread, so hop first.
+        try { BeginInvoke(new Action(ScheduleDisplayRecovery)); } catch { }
+    }
+
+    private void WirePlayback(PlaybackController p)
+    {
+        p.MediaEnded += OnMediaEnded;
+        p.MediaFailed += OnMediaFailed;
+        p.StateChanged += OnPlaybackStateChanged;
+        // After a pipeline recycle the old Player is gone and replaced — the
+        // VideoView must be rebound to the new instance before the next Play
+        // call, or video paints into nothing.
+        p.PipelineRecycled += OnPipelineRecycled;
+    }
+
+    private void UnwirePlayback(PlaybackController p)
+    {
+        p.MediaEnded -= OnMediaEnded;
+        p.MediaFailed -= OnMediaFailed;
+        p.StateChanged -= OnPlaybackStateChanged;
+        p.PipelineRecycled -= OnPipelineRecycled;
+    }
+
+    private void OnPipelineRecycled() => _playback.AttachTo(_videoHost.VideoView);
+
+    /// <summary>
+    /// In-process equivalent of closing and reopening the app. Used when the
+    /// playback worker is stuck inside a libvlc call that will never return —
+    /// at that point no queued command (not even a rescue Recycle) can ever
+    /// run, so the whole controller is abandoned and a fresh one built. The
+    /// wedged controller's threads are background threads; they die with the
+    /// process. Rate-limited so a repeatedly-wedging environment (e.g. GPU
+    /// mid-reset) can't make us churn out leaked pipelines in a tight loop.
+    /// </summary>
+    private void RebuildPlaybackEngine(string why)
+    {
+        long now = Environment.TickCount64;
+        if (now - _lastEngineRebuildTicks < EngineRebuildMinIntervalMs) return;
+        _lastEngineRebuildTicks = now;
+        _consecutiveEngineRebuilds++;
+        if (_consecutiveEngineRebuilds == MaxConsecutiveEngineRebuilds)
+            _errorPanel.Log("Several engine rebuilds without playback succeeding — pausing automatic recovery. Use Player > Reset Player, or restart the app.");
+
+        _errorPanel.Log("Playback engine unresponsive (" + why + ") — replacing it with a fresh one.");
+        var old = _playback;
+        long resumeMs = old.TimeMs;   // cached values — safe even when wedged
+        int volume = old.Volume;
+        bool muted = old.Muted;
+        UnwirePlayback(old);
+
+        PlaybackController fresh;
+        try { fresh = new PlaybackController(); }
+        catch (Exception ex)
+        {
+            // Couldn't even build a new engine — keep limping with the old one.
+            WirePlayback(old);
+            _errorPanel.Log("Engine rebuild failed: " + ex.Message);
+            return;
+        }
+        _playback = fresh;
+        WirePlayback(fresh);
+        // Rebind the view while the old player is still alive (detaching calls
+        // into it), then abandon the old controller.
+        fresh.AttachTo(_videoHost.VideoView);
+        try { old.Abandon(); } catch { }
+
+        fresh.Volume = volume;
+        fresh.Muted = muted;
+        _transport.SetMuteGlyph(muted);
+        if (_currentFullPath != null && File.Exists(_currentFullPath))
+            fresh.PlayAt(_currentFullPath, resumeMs);
     }
 
     // True when the window under the given screen point has our form as its
@@ -540,6 +632,10 @@ public sealed class MainForm : Form
         if (IsDisposed) return;
         BeginInvoke(new Action(() =>
         {
+            // Real playback succeeded — the engine is healthy, so re-arm the
+            // bounded auto-rebuild allowance.
+            if (_playback.IsPlaying && _consecutiveEngineRebuilds != 0)
+                _consecutiveEngineRebuilds = 0;
             _transport.SetPlayPauseGlyph(_playback.IsPlaying);
             if (!_resumeApplied && _playback.IsPlaying && _resumePositionMs > 0)
             {
@@ -841,12 +937,14 @@ public sealed class MainForm : Form
 
     // Debounce: coalesce the burst of power/display messages that arrive when
     // displays wake, and give the GPU a moment to settle before rebuilding.
+    // 3s rather than something snappier: this machine's display-wake is rough
+    // enough to crash other apps, so don't poke D3D mid-transition.
     private void ScheduleDisplayRecovery()
     {
         if (IsDisposed || !IsHandleCreated) return;
         if (_displayRecoveryTimer == null)
         {
-            _displayRecoveryTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+            _displayRecoveryTimer = new System.Windows.Forms.Timer { Interval = 3000 };
             _displayRecoveryTimer.Tick += (_, __) =>
             {
                 _displayRecoveryTimer!.Stop();
@@ -861,7 +959,18 @@ public sealed class MainForm : Form
     {
         if (IsDisposed || !IsHandleCreated) return;
         if (_currentFullPath == null) return; // nothing loaded — nothing to rebuild
-        _errorPanel.Log("Display returned from power-off — rebuilding video pipeline.");
+        if (_playback.WorkerLooksWedged(EngineWedgeThresholdMs))
+        {
+            // The worker starved while the display was away (a Play/Stop that
+            // wedged mid-transition). A queued Recycle would just sit behind
+            // the stuck call forever — replace the whole engine instead.
+            // A display event means conditions genuinely changed, so the
+            // bounded rebuild allowance starts fresh.
+            _consecutiveEngineRebuilds = 0;
+            RebuildPlaybackEngine("the engine wedged while the display was off");
+            return;
+        }
+        _errorPanel.Log("Display/system resumed — rebuilding the playback pipeline.");
         try { _playback.Recycle(); }
         catch (Exception ex) { _errorPanel.Log("Auto display-recovery failed: " + ex.Message); }
     }
@@ -1003,6 +1112,7 @@ public sealed class MainForm : Form
         try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
         try { UnregisterDisplayNotify(); } catch { }
         try { _displayRecoveryTimer?.Stop(); _displayRecoveryTimer?.Dispose(); } catch { }
+        try { _engineWatchdog?.Stop(); _engineWatchdog?.Dispose(); } catch { }
         try { _mouseHook.Dispose(); } catch { }
         try { _durations?.Dispose(); } catch { }
         try { _playback.Dispose(); } catch { }

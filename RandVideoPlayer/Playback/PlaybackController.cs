@@ -59,6 +59,25 @@ public sealed class PlaybackController : IDisposable
     private readonly Thread _worker;
     private volatile bool _disposed;
 
+    // Stamped (Environment.TickCount64) when the worker begins an item, reset
+    // to 0 when it finishes. Lets the UI-side watchdog detect a libvlc call
+    // that will never return — e.g. Stop/Play against a video output whose
+    // D3D device died while the monitors were powered off. A wedged worker
+    // starves the whole queue: every Play/Pause/Next silently no-ops while
+    // the window itself stays responsive.
+    private long _workStartedAtTicks;
+
+    /// <summary>
+    /// True if the worker has been stuck inside a single libvlc call for at
+    /// least <paramref name="thresholdMs"/>. When this trips, the controller
+    /// is beyond saving — <see cref="Abandon"/> it and build a fresh one.
+    /// </summary>
+    public bool WorkerLooksWedged(int thresholdMs)
+    {
+        long started = Interlocked.Read(ref _workStartedAtTicks);
+        return started != 0 && Environment.TickCount64 - started >= thresholdMs;
+    }
+
     public PlaybackController()
     {
         _ui = SynchronizationContext.Current;
@@ -77,14 +96,27 @@ public sealed class PlaybackController : IDisposable
 
     private void WirePlayerEvents(MediaPlayer p)
     {
-        p.EndReached += (_, __) => { _cachedState = VLCState.Ended; RunOnUi(() => MediaEnded?.Invoke()); };
+        // Every handler first checks the event came from the CURRENT player.
+        // Recycled/abandoned pipelines are torn down asynchronously on a
+        // sacrificial thread and can keep firing events (a final Stopped, a
+        // stale TimeChanged, even EndReached) after the new player is live —
+        // without the guard those would corrupt the cached state, skip a
+        // track, or log phantom errors.
+        p.EndReached += (_, __) =>
+        {
+            if (!ReferenceEquals(p, Player)) return;
+            _cachedState = VLCState.Ended;
+            RunOnUi(() => MediaEnded?.Invoke());
+        };
         p.EncounteredError += (_, __) =>
         {
+            if (!ReferenceEquals(p, Player)) return;
             _cachedState = VLCState.Error;
             RunOnUi(() => MediaFailed?.Invoke("VLC EncounteredError on " + (_currentPath ?? "?")));
         };
         p.Playing += (_, __) =>
         {
+            if (!ReferenceEquals(p, Player)) return;
             _cachedState = VLCState.Playing;
             _sawPlaying = true;
             // Reapply audio on the WORKER, not the UI thread — Player.Mute/
@@ -92,14 +124,29 @@ public sealed class PlaybackController : IDisposable
             EnqueueWork(ReapplyAudio);
             RunOnUi(() => StateChanged?.Invoke());
         };
-        p.Paused += (_, __) => { _cachedState = VLCState.Paused; RunOnUi(() => StateChanged?.Invoke()); };
-        p.Stopped += (_, __) => { _cachedState = VLCState.Stopped; RunOnUi(() => StateChanged?.Invoke()); };
+        p.Paused += (_, __) =>
+        {
+            if (!ReferenceEquals(p, Player)) return;
+            _cachedState = VLCState.Paused;
+            RunOnUi(() => StateChanged?.Invoke());
+        };
+        p.Stopped += (_, __) =>
+        {
+            if (!ReferenceEquals(p, Player)) return;
+            _cachedState = VLCState.Stopped;
+            RunOnUi(() => StateChanged?.Invoke());
+        };
         p.TimeChanged += (_, e) =>
         {
+            if (!ReferenceEquals(p, Player)) return;
             Interlocked.Exchange(ref _cachedTimeMs, e.Time);
             RunOnUi(() => StateChanged?.Invoke());
         };
-        p.LengthChanged += (_, e) => Interlocked.Exchange(ref _cachedLengthMs, e.Length);
+        p.LengthChanged += (_, e) =>
+        {
+            if (!ReferenceEquals(p, Player)) return;
+            Interlocked.Exchange(ref _cachedLengthMs, e.Length);
+        };
     }
 
     private void WorkerLoop()
@@ -108,11 +155,13 @@ public sealed class PlaybackController : IDisposable
         {
             foreach (var work in _workQueue.GetConsumingEnumerable())
             {
+                Interlocked.Exchange(ref _workStartedAtTicks, Environment.TickCount64);
                 try { work(); }
                 catch (Exception ex)
                 {
                     RunOnUi(() => MediaFailed?.Invoke("Worker exception: " + ex.Message));
                 }
+                finally { Interlocked.Exchange(ref _workStartedAtTicks, 0); }
             }
         }
         catch { /* shutting down */ }
@@ -192,54 +241,16 @@ public sealed class PlaybackController : IDisposable
     }
 
     /// <summary>
-    /// Re-initialize playback after a system resume/display wake. The D3D
-    /// video output libvlc uses can be left in a broken state when Windows
-    /// suspends or the GPU loses its device, leaving playback with a black
-    /// video surface and/or a stale audio endpoint. Re-issuing Play on the
-    /// current file at the current playhead position forces a fresh video
-    /// output and audio device.
-    /// </summary>
-    public void ReinitializeAfterResume()
-    {
-        var path = _currentPath;
-        if (string.IsNullOrEmpty(path)) return;
-        // Use the cached playhead — never read Player.Time from the UI thread,
-        // since libvlc may be wedged (which is the whole reason we're resuming).
-        long resumeMs = Interlocked.Read(ref _cachedTimeMs);
-
-        EnqueueWork(() =>
-        {
-            try { Player.Stop(); } catch { }
-            try
-            {
-                var media = new Media(_libVlc, new Uri(path));
-                var old = _currentMedia;
-                _currentMedia = media;
-                Player.Play(media);
-                ReapplyAudio();
-                if (resumeMs > 0)
-                {
-                    try { Player.Time = resumeMs; } catch { }
-                }
-                try { old?.Dispose(); } catch { }
-            }
-            catch (Exception ex)
-            {
-                RunOnUi(() => MediaFailed?.Invoke("Post-resume restart failed: " + ex.Message));
-            }
-        });
-    }
-
-    /// <summary>
-    /// Full teardown and rebuild of the libvlc pipeline — disposes the
-    /// current MediaPlayer *and* LibVLC instance and creates fresh ones.
-    /// Use when the lighter <see cref="ReinitializeAfterResume"/> isn't
-    /// enough (e.g. after a very long idle, a monitor-only sleep that never
-    /// fires PowerModes.Resume, or a GPU device loss that leaves audio AND
-    /// video unable to recover via replay alone). The host must listen for
-    /// <see cref="PipelineRecycled"/> and reattach its VideoView to the new
-    /// <see cref="Player"/>. If a file was loaded, it is restarted at the
-    /// playhead position captured before teardown.
+    /// Full rebuild of the libvlc pipeline: creates a fresh LibVLC and
+    /// MediaPlayer, fires <see cref="PipelineRecycled"/> so the host rebinds
+    /// its VideoView, then replays the current file at the captured playhead.
+    /// Used for every resume/display-wake recovery path and the manual Reset
+    /// Player menu item. The OLD pipeline is torn down on a sacrificial
+    /// thread, NOT the worker: Stop/Dispose on a player whose D3D video
+    /// output died with the display can block forever, and doing that on the
+    /// worker starved the queue — every subsequent Play/Pause/Next became a
+    /// silent no-op (the morning-after symptom). If teardown wedges we leak
+    /// that one pipeline; it dies with the process.
     /// </summary>
     public void Recycle()
     {
@@ -257,37 +268,72 @@ public sealed class PlaybackController : IDisposable
             Interlocked.Exchange(ref _cachedTimeMs, resumeMs);
             Interlocked.Exchange(ref _cachedLengthMs, 0);
 
-            try { oldPlayer.Stop(); } catch { }
-            try { oldMedia?.Dispose(); } catch { }
-            try { oldPlayer.Dispose(); } catch { }
-            try { oldLibVlc.Dispose(); } catch { }
-
+            LibVLC newVlc;
+            MediaPlayer newPlayer;
             try
             {
-                _libVlc = new LibVLC("--no-video-title-show");
-                var newPlayer = new MediaPlayer(_libVlc);
-                WirePlayerEvents(newPlayer);
-                Player = newPlayer;
+                newVlc = new LibVLC("--no-video-title-show");
+                newPlayer = new MediaPlayer(newVlc);
             }
             catch (Exception ex)
             {
+                DisposeOnSacrificialThread(oldPlayer, oldLibVlc, oldMedia);
                 RunOnUi(() => MediaFailed?.Invoke("Pipeline recycle failed: " + ex.Message));
                 return;
             }
+            WirePlayerEvents(newPlayer);
+            _libVlc = newVlc;
+            Player = newPlayer;
 
-            // Host must reattach VideoView to the new Player before we start
-            // the file, otherwise the video surface will paint into nothing.
             // Audio (Volume/Mute) is reapplied by ReapplyAudio inside the
             // PlayAt -> PlayOnWorker path below, so we don't touch Player.* on
-            // the UI thread here. The only UI-thread work is rebinding the
-            // VideoView to the freshly created Player.
+            // the UI thread here.
             RunOnUi(() =>
             {
+                // Order matters: rebind the view FIRST — detaching calls into
+                // the old player (Hwnd = 0), which must still be alive — then
+                // hand the old pipeline to the sacrificial teardown thread.
                 try { PipelineRecycled?.Invoke(); } catch { }
+                DisposeOnSacrificialThread(oldPlayer, oldLibVlc, oldMedia);
                 if (!string.IsNullOrEmpty(path) && File.Exists(path))
                     PlayAt(path, resumeMs);
             });
         });
+    }
+
+    // Tears a pipeline down on a throwaway background thread. Healthy case:
+    // finishes in milliseconds. Wedged case (vout dead after display loss):
+    // the thread blocks forever, we leak one pipeline, and nothing else is
+    // affected — crucially, the worker queue keeps draining.
+    private static void DisposeOnSacrificialThread(MediaPlayer? player, LibVLC? vlc, Media? media)
+    {
+        var t = new Thread(() =>
+        {
+            try { player?.Stop(); } catch { }
+            try { media?.Dispose(); } catch { }
+            try { player?.Dispose(); } catch { }
+            try { vlc?.Dispose(); } catch { }
+        })
+        { IsBackground = true, Name = "RVP-VLC-Teardown" };
+        t.Start();
+    }
+
+    /// <summary>
+    /// Last-resort detach for when the worker thread itself is wedged inside
+    /// a libvlc call that will never return (<see cref="WorkerLooksWedged"/>):
+    /// stops accepting work and best-effort tears the pipeline down on a
+    /// sacrificial thread. Never joins anything — the wedged worker is a
+    /// background thread and simply dies with the process. The owner must
+    /// discard this instance and build a fresh controller; queued-but-unrun
+    /// commands are lost.
+    /// </summary>
+    public void Abandon()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        try { _watchdog?.Stop(); _watchdog?.Dispose(); } catch { }
+        try { _workQueue.CompleteAdding(); } catch { }
+        DisposeOnSacrificialThread(Player, _libVlc, _currentMedia);
     }
 
     // Some backends ignore volume writes while muted, so always unmute first,
