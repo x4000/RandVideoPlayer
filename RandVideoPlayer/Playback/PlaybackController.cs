@@ -43,6 +43,15 @@ public sealed class PlaybackController : IDisposable
     private long _cachedLengthMs;
     private volatile VLCState _cachedState = VLCState.NothingSpecial;
 
+    // The VideoView's window handle, captured on the UI thread by AttachTo.
+    // The worker RE-asserts Player.Hwnd = _boundHwnd immediately before every
+    // Play (see PlayOnWorker). LibVLCSharp's VideoView only sets the handle
+    // once, at attach time, and never re-asserts it; if the player's Hwnd is 0
+    // (or stale) at the instant libvlc creates its video output, libvlc opens
+    // the video in its OWN standalone top-level window instead of embedding it
+    // in our control. Re-asserting right before Play closes every such window.
+    private volatile IntPtr _boundHwnd = IntPtr.Zero;
+
     // Captured at construction on the UI thread. All callbacks libvlc fires
     // on its own event thread are marshaled here before touching MediaPlayer
     // state. Without this, rapid track changes can deadlock: UI thread inside
@@ -181,7 +190,16 @@ public sealed class PlaybackController : IDisposable
 
     public void AttachTo(LibVLCSharp.WinForms.VideoView view)
     {
-        view.MediaPlayer = Player;
+        // Reading view.Handle creates the native window if needed. Stash it so
+        // the worker can re-assert it before each Play, and bind the current
+        // player now. The explicit Player.Hwnd set is a belt-and-suspenders in
+        // case VideoView's own attach was skipped (e.g. detaching a previous,
+        // broken player threw before it reached the attach).
+        IntPtr h;
+        try { h = view.Handle; } catch { h = IntPtr.Zero; }
+        _boundHwnd = h;
+        try { view.MediaPlayer = Player; } catch { }
+        try { if (h != IntPtr.Zero) Player.Hwnd = h; } catch { }
     }
 
     public void Play(string fullPath) => PlayAt(fullPath, 0);
@@ -215,6 +233,13 @@ public sealed class PlaybackController : IDisposable
         {
             var media = new Media(_libVlc, new Uri(fullPath));
             _currentMedia = media;
+            // Re-assert the embed target right before play. If Player.Hwnd were
+            // 0 (or pointing at a dead window) at this moment, libvlc would
+            // create its own standalone video window instead of drawing into
+            // our VideoView. This runs on the worker with the handle captured
+            // on the UI thread, so it never reads a UI control from here.
+            var h = _boundHwnd;
+            if (h != IntPtr.Zero) { try { Player.Hwnd = h; } catch { } }
             Player.Play(media);
             // Apply audio state once now (for backends that accept it pre-pipeline)
             // and again on the Playing event (for backends that need the pipeline live).

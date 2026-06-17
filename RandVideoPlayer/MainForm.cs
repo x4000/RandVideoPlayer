@@ -113,6 +113,11 @@ public sealed class MainForm : Form
 
         _videoHost = new VideoHost();
         _playback.AttachTo(_videoHost.VideoView);
+        // If WinForms ever recreates the VideoView's window handle (e.g. on a
+        // display/topology change), LibVLCSharp will not re-point libvlc at the
+        // new HWND on its own — video would escape into a standalone window.
+        // Re-bind and replay onto the live handle when that happens.
+        _videoHost.VideoView.HandleCreated += OnVideoViewHandleCreated;
 
         _sidebar = new Sidebar { Visible = _settings.SidebarVisible };
         _sidebar.Mode = _settings.SidebarShowShuffleOrder ? Sidebar.ViewMode.ShuffleOrder : Sidebar.ViewMode.Alphabetical;
@@ -266,6 +271,19 @@ public sealed class MainForm : Form
     }
 
     private void OnPipelineRecycled() => _playback.AttachTo(_videoHost.VideoView);
+
+    private bool _videoHandleSeen;
+    private void OnVideoViewHandleCreated(object? sender, EventArgs e)
+    {
+        // The first creation is the normal startup attach — already handled.
+        if (!_videoHandleSeen) { _videoHandleSeen = true; return; }
+        // A genuine RE-creation: the player's Hwnd now points at a destroyed
+        // window. Re-bind to the live handle and rebuild so the new video
+        // output renders into the control rather than its own window.
+        if (IsDisposed) return;
+        _playback.AttachTo(_videoHost.VideoView);
+        ScheduleDisplayRecovery();
+    }
 
     /// <summary>
     /// In-process equivalent of closing and reopening the app. Used when the
