@@ -190,19 +190,39 @@ public sealed class PlaybackController : IDisposable
 
     public void AttachTo(LibVLCSharp.WinForms.VideoView view)
     {
-        // Reading view.Handle creates the native window if needed. Stash it so
-        // the worker can re-assert it before each Play, and bind the current
-        // player now. The explicit Player.Hwnd set is a belt-and-suspenders in
-        // case VideoView's own attach was skipped (e.g. detaching a previous,
-        // broken player threw before it reached the attach).
+        // Bind the player to the control's window handle DIRECTLY, and never
+        // touch view.MediaPlayer. LibVLCSharp's VideoView setter would first
+        // Detach whatever player was previously bound — i.e. set the OLD
+        // player's Hwnd to 0. A detached-but-not-yet-disposed old player whose
+        // dead video output later revives (when the GPU wakes up) then has
+        // nowhere to embed and reopens that video in its OWN standalone
+        // top-level window. By ONLY ever setting a valid Hwnd and never zeroing
+        // one, no player — current or half-torn-down — can ever go standalone.
+        // Reading view.Handle creates the native window if needed; we stash it
+        // so the worker can re-assert it before every Play (see PlayOnWorker).
         IntPtr h;
         try { h = view.Handle; } catch { h = IntPtr.Zero; }
         _boundHwnd = h;
-        try { view.MediaPlayer = Player; } catch { }
         try { if (h != IntPtr.Zero) Player.Hwnd = h; } catch { }
     }
 
     public void Play(string fullPath) => PlayAt(fullPath, 0);
+
+    /// <summary>
+    /// Re-issue playback of the current file at the current position on the
+    /// EXISTING player — no new LibVLC/MediaPlayer is created, so the player
+    /// keeps its window binding and the video simply re-embeds in place. This
+    /// is the primary recovery after a monitor power-off: the libvlc instance
+    /// is almost always fine, only its video output died, and replaying forces
+    /// a fresh video output on the same (still-embedded) player. No-op if no
+    /// file is loaded.
+    /// </summary>
+    public void ReplayCurrent()
+    {
+        var path = _currentPath;
+        if (string.IsNullOrEmpty(path)) return;
+        PlayAt(path, Interlocked.Read(ref _cachedTimeMs));
+    }
 
     public void PlayAt(string fullPath, long startMs)
     {
@@ -223,6 +243,11 @@ public sealed class PlaybackController : IDisposable
 
     private void PlayOnWorker(string fullPath, long startMs)
     {
+        // An abandoned controller (see Abandon) must never start new playback.
+        // Otherwise a Play that was queued just before this controller was
+        // replaced would create an orphaned, view-less player that opens its
+        // own standalone window.
+        if (_disposed) return;
         // IMPORTANT: do NOT dispose the old media before Player.Play returns.
         // libvlc is still holding a ref to the currently-playing media until
         // Play(new) atomically swaps to the new one. Disposing first was a
@@ -284,6 +309,9 @@ public sealed class PlaybackController : IDisposable
 
         EnqueueWork(() =>
         {
+            // Don't rebuild on a controller that's been abandoned out from
+            // under us — its replacement already owns the VideoView.
+            if (_disposed) return;
             var oldPlayer = Player;
             var oldLibVlc = _libVlc;
             var oldMedia = _currentMedia;

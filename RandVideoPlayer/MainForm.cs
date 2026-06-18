@@ -388,6 +388,10 @@ public sealed class MainForm : Form
         base.OnShown(e);
         // Re-apply native chrome once all child handles exist.
         DarkChrome.ApplyTreeTheme(this, _theme.IsDark);
+        // Re-bind now that the window handles are created and stable, so the
+        // captured video HWND is the real one — not a transient handle from
+        // construction time that WinForms may have since recreated.
+        _playback.AttachTo(_videoHost.VideoView);
         if (!string.IsNullOrEmpty(_settings.LastFolder) && Directory.Exists(_settings.LastFolder))
             OpenFolder(_settings.LastFolder);
         else
@@ -980,16 +984,20 @@ public sealed class MainForm : Form
         if (_playback.WorkerLooksWedged(EngineWedgeThresholdMs))
         {
             // The worker starved while the display was away (a Play/Stop that
-            // wedged mid-transition). A queued Recycle would just sit behind
-            // the stuck call forever — replace the whole engine instead.
+            // wedged mid-transition). A queued replay would just sit behind the
+            // stuck call forever — replace the whole engine instead.
             // A display event means conditions genuinely changed, so the
             // bounded rebuild allowance starts fresh.
             _consecutiveEngineRebuilds = 0;
             RebuildPlaybackEngine("the engine wedged while the display was off");
             return;
         }
-        _errorPanel.Log("Display/system resumed — rebuilding the playback pipeline.");
-        try { _playback.Recycle(); }
+        // Common case: libvlc is fine, only its video output died. Replay the
+        // current file on the EXISTING player — it keeps its window binding, so
+        // the video re-embeds in place. No new player is created, so there is
+        // nothing that can escape into a detached standalone window.
+        _errorPanel.Log("Display/system resumed — restarting playback on the current video.");
+        try { _playback.ReplayCurrent(); }
         catch (Exception ex) { _errorPanel.Log("Auto display-recovery failed: " + ex.Message); }
     }
 
