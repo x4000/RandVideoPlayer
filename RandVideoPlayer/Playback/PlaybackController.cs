@@ -9,9 +9,14 @@ namespace RandVideoPlayer.Playback;
 
 public sealed class PlaybackController : IDisposable
 {
-    private LibVLC _libVlc;
+    // volatile: both are swapped on the worker thread during Recycle and read
+    // from the UI thread and libvlc's event thread (e.g. the ReferenceEquals(p,
+    // Player) staleness guards). Without the barrier a reader could observe a
+    // stale Player/_libVlc around the swap and let a stale event through.
+    private volatile LibVLC _libVlc;
     public LibVLC LibVlcInstance => _libVlc;
-    public MediaPlayer Player { get; private set; }
+    private volatile MediaPlayer _player;
+    public MediaPlayer Player => _player;
 
     public event Action? MediaEnded;
     public event Action<string>? MediaFailed;
@@ -92,7 +97,7 @@ public sealed class PlaybackController : IDisposable
         _ui = SynchronizationContext.Current;
         Core.Initialize();
         _libVlc = new LibVLC("--no-video-title-show");
-        Player = new MediaPlayer(_libVlc);
+        _player = new MediaPlayer(_libVlc);
         WirePlayerEvents(Player);
 
         _worker = new Thread(WorkerLoop)
@@ -336,15 +341,15 @@ public sealed class PlaybackController : IDisposable
             }
             WirePlayerEvents(newPlayer);
             _libVlc = newVlc;
-            Player = newPlayer;
+            _player = newPlayer;
 
             // Audio (Volume/Mute) is reapplied by ReapplyAudio inside the
             // PlayAt -> PlayOnWorker path below, so we don't touch Player.* on
             // the UI thread here.
             RunOnUi(() =>
             {
-                // Order matters: rebind the view FIRST — detaching calls into
-                // the old player (Hwnd = 0), which must still be alive — then
+                // Rebind the view to the new player FIRST (AttachTo just sets
+                // the new player's Hwnd — it never touches the old player), then
                 // hand the old pipeline to the sacrificial teardown thread.
                 try { PipelineRecycled?.Invoke(); } catch { }
                 DisposeOnSacrificialThread(oldPlayer, oldLibVlc, oldMedia);
@@ -362,6 +367,10 @@ public sealed class PlaybackController : IDisposable
     {
         var t = new Thread(() =>
         {
+            // Mute first — a non-blocking var-set. If Stop/Dispose then wedges
+            // on a dead vout, this abandoned player can't keep emitting "ghost"
+            // audio underneath the live one for the lifetime of the leak.
+            try { if (player != null) player.Mute = true; } catch { }
             try { player?.Stop(); } catch { }
             try { media?.Dispose(); } catch { }
             try { player?.Dispose(); } catch { }
@@ -400,6 +409,9 @@ public sealed class PlaybackController : IDisposable
 
     private void StartWatchdog()
     {
+        // Don't arm a watchdog on an abandoned controller — its Tick would fire
+        // MediaFailed into a controller nobody listens to, leaking the Timer.
+        if (_disposed) return;
         _watchdog?.Stop();
         _watchdog?.Dispose();
         _watchdog = new System.Windows.Forms.Timer { Interval = 3500 };

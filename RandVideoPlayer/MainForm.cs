@@ -73,6 +73,17 @@ public sealed class MainForm : Form
     private const int EngineRebuildMinIntervalMs = 60_000; // never thrash rebuilds in a loop
     private const int MaxConsecutiveEngineRebuilds = 5;  // each abandoned engine leaks; bound the damage
 
+    // Escalation bridge. A light recovery (ReplayCurrent on the existing player)
+    // can come up black with no Playing event; the 3.5s watchdog then fires
+    // MediaFailed -> GoNext, which would just advance the playlist file-by-file
+    // on a permanently black pipeline. After enough consecutive failures with no
+    // successful Playing in between, escalate to a real pipeline rebuild instead
+    // of skipping. Rate-limited so a genuinely undecodable file can't loop on it.
+    private int _consecutivePlaybackFailures;
+    private long _lastPlaybackEscalationTicks;
+    private const int PlaybackFailuresBeforeEscalation = 4;
+    private const int PlaybackEscalationMinIntervalMs = 30_000;
+
     public MainForm(AppSettings settings)
     {
         _settings = settings;
@@ -253,33 +264,38 @@ public sealed class MainForm : Form
 
     private void WirePlayback(PlaybackController p)
     {
-        p.MediaEnded += OnMediaEnded;
-        p.MediaFailed += OnMediaFailed;
-        p.StateChanged += OnPlaybackStateChanged;
-        // After a pipeline recycle the old Player is gone and replaced — the
-        // VideoView must be rebound to the new instance before the next Play
-        // call, or video paints into nothing.
-        p.PipelineRecycled += OnPipelineRecycled;
+        // Every callback is gated on the raising controller STILL being the
+        // current one. After RebuildPlaybackEngine swaps _playback, the
+        // abandoned controller can still deliver already-queued events — a dying
+        // vout's final EndReached/EncounteredError, a stale PipelineRecycled —
+        // and acting on those would skip tracks in the shuffle or rebind the
+        // VideoView to the wrong player. The capture of `p` plus the
+        // ReferenceEquals check is the boundary equivalent of the controller's
+        // internal ReferenceEquals(p, Player) guard. (No Unwire needed: a stale
+        // controller's events are simply ignored until it is GC'd.)
+        p.MediaEnded += () => { if (ReferenceEquals(_playback, p)) OnMediaEnded(); };
+        p.MediaFailed += m => { if (ReferenceEquals(_playback, p)) OnMediaFailed(m); };
+        p.StateChanged += () => { if (ReferenceEquals(_playback, p)) OnPlaybackStateChanged(); };
+        p.PipelineRecycled += () => { if (ReferenceEquals(_playback, p)) OnPipelineRecycled(); };
     }
 
-    private void UnwirePlayback(PlaybackController p)
+    private void OnPipelineRecycled()
     {
-        p.MediaEnded -= OnMediaEnded;
-        p.MediaFailed -= OnMediaFailed;
-        p.StateChanged -= OnPlaybackStateChanged;
-        p.PipelineRecycled -= OnPipelineRecycled;
+        if (IsDisposed) return;
+        _playback.AttachTo(_videoHost.VideoView);
     }
 
-    private void OnPipelineRecycled() => _playback.AttachTo(_videoHost.VideoView);
-
-    private bool _videoHandleSeen;
     private void OnVideoViewHandleCreated(object? sender, EventArgs e)
     {
-        // The first creation is the normal startup attach — already handled.
-        if (!_videoHandleSeen) { _videoHandleSeen = true; return; }
-        // A genuine RE-creation: the player's Hwnd now points at a destroyed
-        // window. Re-bind to the live handle and rebuild so the new video
-        // output renders into the control rather than its own window.
+        // The VideoView's INITIAL handle creation happens during construction
+        // (AttachTo reads view.Handle) BEFORE this handler is wired, so every
+        // invocation we actually receive is a RE-creation: the current player's
+        // Hwnd now points at a destroyed window. Re-bind to the live handle and
+        // replay so the video re-embeds instead of opening its own window.
+        // (The earlier "skip the first event" guard was an off-by-one — it
+        // swallowed the first real recreation.) Re-binding is idempotent and
+        // ScheduleDisplayRecovery no-ops when nothing is loaded, so this is safe
+        // even on the rare chance the initial creation is observed here.
         if (IsDisposed) return;
         _playback.AttachTo(_videoHost.VideoView);
         ScheduleDisplayRecovery();
@@ -308,21 +324,21 @@ public sealed class MainForm : Form
         long resumeMs = old.TimeMs;   // cached values — safe even when wedged
         int volume = old.Volume;
         bool muted = old.Muted;
-        UnwirePlayback(old);
 
         PlaybackController fresh;
         try { fresh = new PlaybackController(); }
         catch (Exception ex)
         {
             // Couldn't even build a new engine — keep limping with the old one.
-            WirePlayback(old);
+            // (old is still _playback, so its guarded events still route here.)
             _errorPanel.Log("Engine rebuild failed: " + ex.Message);
             return;
         }
+        // Publish the swap BEFORE wiring/attaching: the WirePlayback guards and
+        // every stale event from `old` key off ReferenceEquals(_playback, ...),
+        // so `_playback` must already point at `fresh`.
         _playback = fresh;
         WirePlayback(fresh);
-        // Rebind the view while the old player is still alive (detaching calls
-        // into it), then abandon the old controller.
         fresh.AttachTo(_videoHost.VideoView);
         try { old.Abandon(); } catch { }
 
@@ -645,7 +661,27 @@ public sealed class MainForm : Form
         BeginInvoke(new Action(() =>
         {
             _errorPanel.Log(message);
-            GoNext();
+            _consecutivePlaybackFailures++;
+            long now = Environment.TickCount64;
+            bool manyInARow = _consecutivePlaybackFailures >= PlaybackFailuresBeforeEscalation;
+            bool escalationAllowed = now - _lastPlaybackEscalationTicks >= PlaybackEscalationMinIntervalMs;
+            if (manyInARow && escalationAllowed && _currentFullPath != null)
+            {
+                // Files failing back-to-back means the PIPELINE is dead, not the
+                // files — a black recovery that never reached Playing. Rebuild
+                // rather than skipping forever on a black screen.
+                _lastPlaybackEscalationTicks = now;
+                _consecutivePlaybackFailures = 0;
+                _errorPanel.Log("Repeated playback failures — rebuilding the pipeline instead of skipping.");
+                if (_playback.WorkerLooksWedged(EngineWedgeThresholdMs))
+                    RebuildPlaybackEngine("repeated playback failures with the worker stuck");
+                else
+                    try { _playback.Recycle(); } catch (Exception ex) { _errorPanel.Log("Recycle failed: " + ex.Message); }
+            }
+            else
+            {
+                GoNext();
+            }
         }));
     }
 
@@ -655,9 +691,12 @@ public sealed class MainForm : Form
         BeginInvoke(new Action(() =>
         {
             // Real playback succeeded — the engine is healthy, so re-arm the
-            // bounded auto-rebuild allowance.
-            if (_playback.IsPlaying && _consecutiveEngineRebuilds != 0)
+            // bounded auto-rebuild allowance and clear the failure streak.
+            if (_playback.IsPlaying)
+            {
                 _consecutiveEngineRebuilds = 0;
+                _consecutivePlaybackFailures = 0;
+            }
             _transport.SetPlayPauseGlyph(_playback.IsPlaying);
             if (!_resumeApplied && _playback.IsPlaying && _resumePositionMs > 0)
             {
@@ -928,8 +967,14 @@ public sealed class MainForm : Form
     // PowerModes.Resume misses.
     private void OnConsoleDisplayState(byte state)
     {
-        if (state == 0) _displayWasOff = true;            // off
-        else if (state == 1 && _displayWasOff)            // on, after having been off
+        // 0 = off, 1 = on, 2 = dimmed. Treat ANYTHING that isn't a clean "on"
+        // as "the display left its normal state" — some drivers report the idle
+        // sequence as on -> dimmed -> on and never deliver a clean 0, but the
+        // GPU can still have dropped its D3D device during the blank. Recovery
+        // is debounced and reuses the existing player, so an over-trigger just
+        // costs one cheap replay; a MISSED off->on costs a black screen.
+        if (state != 1) _displayWasOff = true;
+        else if (_displayWasOff)
         {
             _displayWasOff = false;
             ScheduleDisplayRecovery();
