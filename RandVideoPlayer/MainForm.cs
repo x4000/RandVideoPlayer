@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using RandVideoPlayer.AppState;
@@ -60,6 +61,9 @@ public sealed class MainForm : Form
     private bool _displayWasOff;
     private int _lastScreenCount = -1;
     private System.Windows.Forms.Timer? _displayRecoveryTimer;
+    private System.Windows.Forms.Timer? _detachedWindowAdoptionTimer;
+    private int _detachedWindowAdoptionTicksRemaining;
+    private readonly HashSet<IntPtr> _adoptedVideoWindows = new();
 
     // Engine-wedge watchdog. A libvlc call that never returns (Stop/Play/
     // Dispose against a video output whose D3D device died) permanently
@@ -129,6 +133,7 @@ public sealed class MainForm : Form
         // new HWND on its own — video would escape into a standalone window.
         // Re-bind and replay onto the live handle when that happens.
         _videoHost.VideoView.HandleCreated += OnVideoViewHandleCreated;
+        _videoHost.VideoView.Resize += (_, __) => FitAdoptedVideoWindows();
 
         _sidebar = new Sidebar { Visible = _settings.SidebarVisible };
         _sidebar.Mode = _settings.SidebarShowShuffleOrder ? Sidebar.ViewMode.ShuffleOrder : Sidebar.ViewMode.Alphabetical;
@@ -299,6 +304,7 @@ public sealed class MainForm : Form
         if (IsDisposed) return;
         _playback.AttachTo(_videoHost.VideoView);
         ScheduleDisplayRecovery();
+        StartDetachedWindowAdoptionSweep();
     }
 
     /// <summary>
@@ -347,6 +353,7 @@ public sealed class MainForm : Form
         _transport.SetMuteGlyph(muted);
         if (_currentFullPath != null && File.Exists(_currentFullPath))
             fresh.PlayAt(_currentFullPath, resumeMs);
+        StartDetachedWindowAdoptionSweep();
     }
 
     // True when the window under the given screen point has our form as its
@@ -1044,6 +1051,133 @@ public sealed class MainForm : Form
         _errorPanel.Log("Display/system resumed — restarting playback on the current video.");
         try { _playback.ReplayCurrent(); }
         catch (Exception ex) { _errorPanel.Log("Auto display-recovery failed: " + ex.Message); }
+        StartDetachedWindowAdoptionSweep();
+    }
+
+    private void StartDetachedWindowAdoptionSweep()
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        AdoptDetachedVideoWindows();
+        _detachedWindowAdoptionTicksRemaining = 20;
+        if (_detachedWindowAdoptionTimer == null)
+        {
+            _detachedWindowAdoptionTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+            _detachedWindowAdoptionTimer.Tick += (_, __) =>
+            {
+                if (IsDisposed || _detachedWindowAdoptionTicksRemaining-- <= 0)
+                {
+                    _detachedWindowAdoptionTimer!.Stop();
+                    return;
+                }
+                AdoptDetachedVideoWindows();
+            };
+        }
+        _detachedWindowAdoptionTimer.Stop();
+        _detachedWindowAdoptionTimer.Start();
+    }
+
+    private void AdoptDetachedVideoWindows()
+    {
+        if (IsDisposed || !IsHandleCreated || !_videoHost.VideoView.IsHandleCreated) return;
+
+        var adoptedThisPass = 0;
+        foreach (var hwnd in EnumerateDetachedProcessWindows())
+        {
+            try
+            {
+                var title = Win32.GetWindowTextSafe(hwnd);
+                var cls = Win32.GetClassNameSafe(hwnd);
+
+                var style = Win32.GetWindowLongPtr(hwnd, Win32.GWL_STYLE).ToInt64();
+                style &= ~(Win32.WS_CAPTION | Win32.WS_THICKFRAME | Win32.WS_MINIMIZEBOX |
+                           Win32.WS_MAXIMIZEBOX | Win32.WS_SYSMENU | Win32.WS_POPUP);
+                style |= Win32.WS_CHILD | Win32.WS_VISIBLE | Win32.WS_CLIPSIBLINGS | Win32.WS_CLIPCHILDREN;
+                Win32.SetWindowLongPtr(hwnd, Win32.GWL_STYLE, new IntPtr(style));
+
+                Win32.SetParent(hwnd, _videoHost.VideoView.Handle);
+                _adoptedVideoWindows.Add(hwnd);
+                FitAdoptedVideoWindow(hwnd);
+                adoptedThisPass++;
+
+                _errorPanel.Log("Adopted detached video window back into the player"
+                    + (string.IsNullOrWhiteSpace(title) ? "" : $" (title: {title})")
+                    + (string.IsNullOrWhiteSpace(cls) ? "." : $", class: {cls}."));
+            }
+            catch (Exception ex)
+            {
+                _errorPanel.Log("Failed to adopt detached video window: " + ex.Message);
+            }
+        }
+
+        if (adoptedThisPass == 0)
+            FitAdoptedVideoWindows();
+    }
+
+    private IEnumerable<IntPtr> EnumerateDetachedProcessWindows()
+    {
+        var result = new List<IntPtr>();
+        var thisPid = Environment.ProcessId;
+        var mainRoot = Handle;
+
+        Win32.EnumWindows((hwnd, _) =>
+        {
+            try
+            {
+                if (hwnd == IntPtr.Zero || hwnd == mainRoot) return true;
+                Win32.GetWindowThreadProcessId(hwnd, out var pid);
+                if (pid != thisPid) return true;
+                if (!Win32.IsWindowVisible(hwnd)) return true;
+
+                var root = Win32.GetAncestor(hwnd, Win32.GA_ROOT);
+                if (root == mainRoot) return true; // already part of our main window tree
+                if (Win32.GetWindow(hwnd, Win32.GW_OWNER) != IntPtr.Zero) return true; // dialogs/tool windows
+                if (!LooksLikeNativeDetachedVideoWindow(hwnd)) return true;
+
+                result.Add(hwnd);
+            }
+            catch { }
+            return true;
+        }, IntPtr.Zero);
+
+        return result;
+    }
+
+    private static bool LooksLikeNativeDetachedVideoWindow(IntPtr hwnd)
+    {
+        var cls = Win32.GetClassNameSafe(hwnd);
+        if (string.IsNullOrWhiteSpace(cls)) return true;
+
+        // Avoid swallowing our own menus/dialogs/tooltips if the sweep overlaps
+        // with user input. LibVLC's standalone vout window is a native window,
+        // not a WinForms control or common dialog/menu class.
+        if (cls.StartsWith("WindowsForms", StringComparison.OrdinalIgnoreCase)) return false;
+        if (string.Equals(cls, "#32768", StringComparison.OrdinalIgnoreCase)) return false; // menu
+        if (string.Equals(cls, "#32770", StringComparison.OrdinalIgnoreCase)) return false; // dialog
+        if (string.Equals(cls, "tooltips_class32", StringComparison.OrdinalIgnoreCase)) return false;
+
+        return true;
+    }
+
+    private void FitAdoptedVideoWindows()
+    {
+        if (IsDisposed || !_videoHost.VideoView.IsHandleCreated) return;
+        foreach (var hwnd in _adoptedVideoWindows.ToList())
+        {
+            if (!Win32.IsWindow(hwnd))
+            {
+                _adoptedVideoWindows.Remove(hwnd);
+                continue;
+            }
+            FitAdoptedVideoWindow(hwnd);
+        }
+    }
+
+    private void FitAdoptedVideoWindow(IntPtr hwnd)
+    {
+        var size = _videoHost.VideoView.ClientSize;
+        Win32.SetWindowPos(hwnd, IntPtr.Zero, 0, 0,
+            Math.Max(1, size.Width), Math.Max(1, size.Height),
+            Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE | Win32.SWP_FRAMECHANGED | Win32.SWP_SHOWWINDOW);
     }
 
     private void RebuildRecentMenu()
@@ -1183,6 +1317,7 @@ public sealed class MainForm : Form
         try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
         try { UnregisterDisplayNotify(); } catch { }
         try { _displayRecoveryTimer?.Stop(); _displayRecoveryTimer?.Dispose(); } catch { }
+        try { _detachedWindowAdoptionTimer?.Stop(); _detachedWindowAdoptionTimer?.Dispose(); } catch { }
         try { _engineWatchdog?.Stop(); _engineWatchdog?.Dispose(); } catch { }
         try { _mouseHook.Dispose(); } catch { }
         try { _durations?.Dispose(); } catch { }
@@ -1249,12 +1384,30 @@ internal static class SystemSounds
 internal static class Win32
 {
     public const uint GA_ROOT = 2;
+    public const uint GW_OWNER = 4;
 
     // Display power-state notifications.
     public const int WM_DISPLAYCHANGE = 0x007E;
     public const int WM_POWERBROADCAST = 0x0218;
     public const int PBT_POWERSETTINGCHANGE = 0x8013;
     public const int DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
+
+    public const int GWL_STYLE = -16;
+    public const long WS_CHILD = 0x40000000L;
+    public const long WS_VISIBLE = 0x10000000L;
+    public const long WS_POPUP = 0x80000000L;
+    public const long WS_CAPTION = 0x00C00000L;
+    public const long WS_THICKFRAME = 0x00040000L;
+    public const long WS_SYSMENU = 0x00080000L;
+    public const long WS_MINIMIZEBOX = 0x00020000L;
+    public const long WS_MAXIMIZEBOX = 0x00010000L;
+    public const long WS_CLIPSIBLINGS = 0x04000000L;
+    public const long WS_CLIPCHILDREN = 0x02000000L;
+
+    public const uint SWP_NOZORDER = 0x0004;
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_FRAMECHANGED = 0x0020;
+    public const uint SWP_SHOWWINDOW = 0x0040;
     // GUID_CONSOLE_DISPLAY_STATE — fires when the console display turns
     // off (0), on (1), or dims (2), even though the system never sleeps.
     public static readonly Guid GUID_CONSOLE_DISPLAY_STATE =
@@ -1276,6 +1429,66 @@ internal static class Win32
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern IntPtr GetWindow(IntPtr hwnd, uint uCmd);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    public static extern bool IsWindow(IntPtr hwnd);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    public static extern bool IsWindowVisible(IntPtr hwnd);
+
+    public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out int lpdwProcessId);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+    public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
+    public static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    public static extern bool SetWindowPos(
+        IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int count);
+
+    public static string GetWindowTextSafe(IntPtr hwnd)
+    {
+        try
+        {
+            var sb = new StringBuilder(256);
+            return GetWindowText(hwnd, sb, sb.Capacity) > 0 ? sb.ToString() : "";
+        }
+        catch { return ""; }
+    }
+
+    public static string GetClassNameSafe(IntPtr hwnd)
+    {
+        try
+        {
+            var sb = new StringBuilder(256);
+            return GetClassName(hwnd, sb, sb.Capacity) > 0 ? sb.ToString() : "";
+        }
+        catch { return ""; }
+    }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern bool GetCursorPos(out POINT pt);
