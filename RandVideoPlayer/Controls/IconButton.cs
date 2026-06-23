@@ -15,6 +15,7 @@ public sealed class IconButton : Control, IThemedControl
     private bool _hovered;
     private bool _pressed;
     private Theme _theme = Theme.Dark;
+    private readonly ToolTip _toolTip = new();
     private static readonly Font IconFont = new Font("Segoe MDL2 Assets", 11f, FontStyle.Regular, GraphicsUnit.Point);
 
     public Color? BadgeColor { get; set; }
@@ -37,8 +38,7 @@ public sealed class IconButton : Control, IThemedControl
         Margin = new Padding(2);
         TabStop = false;
         Cursor = Cursors.Hand;
-        var tt = new ToolTip();
-        tt.SetToolTip(this, tooltip);
+        _toolTip.SetToolTip(this, tooltip);
     }
 
     public void ApplyTheme(Theme theme)
@@ -54,6 +54,12 @@ public sealed class IconButton : Control, IThemedControl
     protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); _pressed = false; Invalidate(); }
 
     public void PerformClick() { OnClick(EventArgs.Empty); }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _toolTip.Dispose();
+        base.Dispose(disposing);
+    }
 
     protected override void OnPaint(PaintEventArgs e)
     {

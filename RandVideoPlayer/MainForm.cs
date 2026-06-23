@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
@@ -76,6 +77,9 @@ public sealed class MainForm : Form
     private const int EngineWedgeThresholdMs = 10_000;   // generous: HDD spin-up on a Play can take seconds
     private const int EngineRebuildMinIntervalMs = 60_000; // never thrash rebuilds in a loop
     private const int MaxConsecutiveEngineRebuilds = 5;  // each abandoned engine leaks; bound the damage
+    private int _automaticEngineRebuildsThisSession;
+    private bool _automaticEngineRebuildLimitLogged;
+    private const int MaxAutomaticEngineRebuildsPerSession = 4;
 
     // Escalation bridge. A light recovery (ReplayCurrent on the existing player)
     // can come up black with no Playing event; the 3.5s watchdog then fires
@@ -85,8 +89,11 @@ public sealed class MainForm : Form
     // of skipping. Rate-limited so a genuinely undecodable file can't loop on it.
     private int _consecutivePlaybackFailures;
     private long _lastPlaybackEscalationTicks;
+    private int _automaticPipelineRecyclesThisSession;
+    private bool _automaticPipelineRecycleLimitLogged;
     private const int PlaybackFailuresBeforeEscalation = 4;
     private const int PlaybackEscalationMinIntervalMs = 30_000;
+    private const int MaxAutomaticPipelineRecyclesPerSession = 4;
 
     public MainForm(AppSettings settings)
     {
@@ -220,7 +227,7 @@ public sealed class MainForm : Form
             // If rebuilds keep failing to produce actual playback, stop —
             // each abandoned engine leaks, and something deeper is wrong.
             if (_consecutiveEngineRebuilds >= MaxConsecutiveEngineRebuilds) return;
-            RebuildPlaybackEngine("a playback call has been stuck for over 10 seconds");
+            RebuildPlaybackEngine("a playback call has been stuck for over 10 seconds", automatic: true, ignoreRateLimit: false);
         };
         _engineWatchdog.Start();
 
@@ -316,15 +323,23 @@ public sealed class MainForm : Form
     /// process. Rate-limited so a repeatedly-wedging environment (e.g. GPU
     /// mid-reset) can't make us churn out leaked pipelines in a tight loop.
     /// </summary>
-    private void RebuildPlaybackEngine(string why)
+    private bool RebuildPlaybackEngine(string why, bool automatic, bool ignoreRateLimit)
     {
         long now = Environment.TickCount64;
-        if (now - _lastEngineRebuildTicks < EngineRebuildMinIntervalMs) return;
-        _lastEngineRebuildTicks = now;
-        _consecutiveEngineRebuilds++;
-        if (_consecutiveEngineRebuilds == MaxConsecutiveEngineRebuilds)
-            _errorPanel.Log("Several engine rebuilds without playback succeeding — pausing automatic recovery. Use Player > Reset Player, or restart the app.");
-
+        if (!ignoreRateLimit && now - _lastEngineRebuildTicks < EngineRebuildMinIntervalMs) return false;
+        if (automatic && _automaticEngineRebuildsThisSession >= MaxAutomaticEngineRebuildsPerSession)
+        {
+            if (!_automaticEngineRebuildLimitLogged)
+            {
+                _automaticEngineRebuildLimitLogged = true;
+                _errorPanel.Log("Automatic engine replacement paused after "
+                    + MaxAutomaticEngineRebuildsPerSession
+                    + " attempts this session to prevent runaway VLC memory growth. "
+                    + "Use Player > Reset Player, or restart the app, if playback is still broken. "
+                    + DescribeProcessMemory());
+            }
+            return false;
+        }
         _errorPanel.Log("Playback engine unresponsive (" + why + ") — replacing it with a fresh one.");
         var old = _playback;
         long resumeMs = old.TimeMs;   // cached values — safe even when wedged
@@ -338,8 +353,15 @@ public sealed class MainForm : Form
             // Couldn't even build a new engine — keep limping with the old one.
             // (old is still _playback, so its guarded events still route here.)
             _errorPanel.Log("Engine rebuild failed: " + ex.Message);
-            return;
+            return false;
         }
+        _lastEngineRebuildTicks = now;
+        _consecutiveEngineRebuilds++;
+        if (automatic) _automaticEngineRebuildsThisSession++;
+        if (_consecutiveEngineRebuilds == MaxConsecutiveEngineRebuilds)
+            _errorPanel.Log("Several engine rebuilds without playback succeeding - pausing automatic recovery. Use Player > Reset Player, or restart the app.");
+        _errorPanel.Log(DescribeProcessMemory());
+
         // Publish the swap BEFORE wiring/attaching: the WirePlayback guards and
         // every stale event from `old` key off ReferenceEquals(_playback, ...),
         // so `_playback` must already point at `fresh`.
@@ -354,6 +376,7 @@ public sealed class MainForm : Form
         if (_currentFullPath != null && File.Exists(_currentFullPath))
             fresh.PlayAt(_currentFullPath, resumeMs);
         StartDetachedWindowAdoptionSweep();
+        return true;
     }
 
     // True when the window under the given screen point has our form as its
@@ -382,10 +405,11 @@ public sealed class MainForm : Form
         try
         {
             var asm = Assembly.GetExecutingAssembly();
-            var stream = asm.GetManifestResourceStream("RandVideoPlayer.app.ico");
+            using var stream = asm.GetManifestResourceStream("RandVideoPlayer.app.ico");
             if (stream != null)
             {
-                Icon = new Icon(stream);
+                using var icon = new Icon(stream);
+                Icon = (Icon)icon.Clone();
             }
         }
         catch { }
@@ -437,8 +461,7 @@ public sealed class MainForm : Form
             SavePositionState(withPositionMs: true);
             try { _playback.Stop(); } catch { }
             StopWatcher();
-            _durations?.Dispose();
-            _durations = null;
+            DisposeDurationIndex();
 
             _library = new FolderLibrary(folder);
             _library.Rescan();
@@ -509,6 +532,15 @@ public sealed class MainForm : Form
         }
         if (InvokeRequired) BeginInvoke(new Action(apply));
         else apply();
+    }
+
+    private void DisposeDurationIndex()
+    {
+        var d = _durations;
+        _durations = null;
+        if (d == null) return;
+        try { d.Updated -= OnDurationsUpdated; } catch { }
+        try { d.Dispose(); } catch { }
     }
 
     private static bool ShuffleStillMatches(ShuffleFile sf, FolderLibrary lib)
@@ -677,13 +709,23 @@ public sealed class MainForm : Form
                 // Files failing back-to-back means the PIPELINE is dead, not the
                 // files — a black recovery that never reached Playing. Rebuild
                 // rather than skipping forever on a black screen.
-                _lastPlaybackEscalationTicks = now;
-                _consecutivePlaybackFailures = 0;
                 _errorPanel.Log("Repeated playback failures — rebuilding the pipeline instead of skipping.");
-                if (_playback.WorkerLooksWedged(EngineWedgeThresholdMs))
-                    RebuildPlaybackEngine("repeated playback failures with the worker stuck");
+                bool recoveryStarted;
+                bool workerWedged = _playback.WorkerLooksWedged(EngineWedgeThresholdMs);
+                if (workerWedged)
+                    recoveryStarted = RebuildPlaybackEngine("repeated playback failures with the worker stuck", automatic: true, ignoreRateLimit: false);
                 else
-                    try { _playback.Recycle(); } catch (Exception ex) { _errorPanel.Log("Recycle failed: " + ex.Message); }
+                    recoveryStarted = TryRecyclePlaybackPipeline("repeated playback failures", automatic: true);
+
+                if (recoveryStarted)
+                {
+                    _lastPlaybackEscalationTicks = now;
+                    _consecutivePlaybackFailures = 0;
+                }
+                else if (!workerWedged)
+                {
+                    GoNext();
+                }
             }
             else
             {
@@ -865,8 +907,56 @@ public sealed class MainForm : Form
         // PipelineRecycled (which we use to reattach the VideoView), and then
         // replays the current file at its current playhead position.
         _errorPanel.Log("Player reset: rebuilding video/audio pipeline.");
-        try { _playback.Recycle(); }
-        catch (Exception ex) { _errorPanel.Log("Player reset failed: " + ex.Message); }
+        _automaticEngineRebuildsThisSession = 0;
+        _automaticPipelineRecyclesThisSession = 0;
+        _automaticEngineRebuildLimitLogged = false;
+        _automaticPipelineRecycleLimitLogged = false;
+        if (_playback.WorkerLooksWedged(EngineWedgeThresholdMs))
+            RebuildPlaybackEngine("manual player reset with a wedged worker", automatic: false, ignoreRateLimit: true);
+        else
+            TryRecyclePlaybackPipeline("manual player reset", automatic: false);
+    }
+
+    private bool TryRecyclePlaybackPipeline(string why, bool automatic)
+    {
+        if (automatic && _automaticPipelineRecyclesThisSession >= MaxAutomaticPipelineRecyclesPerSession)
+        {
+            if (!_automaticPipelineRecycleLimitLogged)
+            {
+                _automaticPipelineRecycleLimitLogged = true;
+                _errorPanel.Log("Automatic pipeline rebuild paused after "
+                    + MaxAutomaticPipelineRecyclesPerSession
+                    + " attempts this session to prevent runaway VLC memory growth. "
+                    + "Use Player > Reset Player, or restart the app, if playback is still broken. "
+                    + DescribeProcessMemory());
+            }
+            return false;
+        }
+
+        if (automatic) _automaticPipelineRecyclesThisSession++;
+        _errorPanel.Log("Queued playback pipeline rebuild (" + why + "). " + DescribeProcessMemory());
+        try { _playback.Recycle(); return true; }
+        catch (Exception ex) { _errorPanel.Log("Pipeline rebuild failed: " + ex.Message); return false; }
+    }
+
+    private static string DescribeProcessMemory()
+    {
+        try
+        {
+            using var p = Process.GetCurrentProcess();
+            return "Memory: working set "
+                + FormatBytes(p.WorkingSet64)
+                + ", private "
+                + FormatBytes(p.PrivateMemorySize64)
+                + ".";
+        }
+        catch { return ""; }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        double mb = bytes / (1024d * 1024d);
+        return mb >= 1024d ? (mb / 1024d).ToString("0.0") + " GB" : mb.ToString("0") + " MB";
     }
 
     private void ToggleSidebar() { _sidebar.Visible = !_sidebar.Visible; _settings.SidebarVisible = _sidebar.Visible; }
@@ -1039,9 +1129,10 @@ public sealed class MainForm : Form
             // wedged mid-transition). A queued replay would just sit behind the
             // stuck call forever — replace the whole engine instead.
             // A display event means conditions genuinely changed, so the
-            // bounded rebuild allowance starts fresh.
+            // consecutive rebuild allowance starts fresh. The session-level
+            // budget remains in place to prevent overnight memory blowups.
             _consecutiveEngineRebuilds = 0;
-            RebuildPlaybackEngine("the engine wedged while the display was off");
+            RebuildPlaybackEngine("the engine wedged while the display was off", automatic: true, ignoreRateLimit: false);
             return;
         }
         // Common case: libvlc is fine, only its video output died. Replay the
@@ -1316,11 +1407,14 @@ public sealed class MainForm : Form
         catch { }
         try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
         try { UnregisterDisplayNotify(); } catch { }
+        try { _uiTimer.Stop(); _uiTimer.Dispose(); } catch { }
+        try { _positionSaveTimer.Stop(); _positionSaveTimer.Dispose(); } catch { }
+        try { StopWatcher(); } catch { }
         try { _displayRecoveryTimer?.Stop(); _displayRecoveryTimer?.Dispose(); } catch { }
         try { _detachedWindowAdoptionTimer?.Stop(); _detachedWindowAdoptionTimer?.Dispose(); } catch { }
         try { _engineWatchdog?.Stop(); _engineWatchdog?.Dispose(); } catch { }
         try { _mouseHook.Dispose(); } catch { }
-        try { _durations?.Dispose(); } catch { }
+        try { DisposeDurationIndex(); } catch { }
         try { _playback.Dispose(); } catch { }
     }
 }

@@ -34,6 +34,7 @@ public sealed class PlaybackController : IDisposable
     private int _desiredVolume = 80;
     private bool _desiredMuted;
     private Media? _currentMedia;
+    private volatile Media? _previousMediaPendingDispose;
 
     // Cached playback status, updated only from libvlc events (which fire on
     // libvlc's own thread). The UI thread reads THESE instead of calling
@@ -259,6 +260,7 @@ public sealed class PlaybackController : IDisposable
         // known deadlock recipe — it released our last ref while vlc's event
         // thread was still firing events on the old media.
         Media? oldMedia = _currentMedia;
+        _previousMediaPendingDispose = oldMedia;
         try
         {
             var media = new Media(_libVlc, new Uri(fullPath));
@@ -292,6 +294,8 @@ public sealed class PlaybackController : IDisposable
             // Now it's safe: the player has moved onto the new media (or the
             // attempt failed and we're no longer relying on old).
             try { oldMedia?.Dispose(); } catch { }
+            if (ReferenceEquals(_previousMediaPendingDispose, oldMedia))
+                _previousMediaPendingDispose = null;
         }
     }
 
@@ -326,8 +330,8 @@ public sealed class PlaybackController : IDisposable
             Interlocked.Exchange(ref _cachedTimeMs, resumeMs);
             Interlocked.Exchange(ref _cachedLengthMs, 0);
 
-            LibVLC newVlc;
-            MediaPlayer newPlayer;
+            LibVLC? newVlc = null;
+            MediaPlayer? newPlayer = null;
             try
             {
                 newVlc = new LibVLC("--no-video-title-show");
@@ -335,6 +339,8 @@ public sealed class PlaybackController : IDisposable
             }
             catch (Exception ex)
             {
+                try { newPlayer?.Dispose(); } catch { }
+                try { newVlc?.Dispose(); } catch { }
                 DisposeOnSacrificialThread(oldPlayer, oldLibVlc, oldMedia);
                 RunOnUi(() => MediaFailed?.Invoke("Pipeline recycle failed: " + ex.Message));
                 return;
@@ -367,12 +373,13 @@ public sealed class PlaybackController : IDisposable
     {
         var t = new Thread(() =>
         {
-            // Mute first — a non-blocking var-set. If Stop/Dispose then wedges
-            // on a dead vout, this abandoned player can't keep emitting "ghost"
-            // audio underneath the live one for the lifetime of the leak.
+            // Release our Media wrapper before Stop. If Stop then wedges on a
+            // dead vout, at least that managed/native reference is gone. Mute
+            // remains best-effort so an abandoned player cannot keep emitting
+            // "ghost" audio underneath the live one.
+            try { media?.Dispose(); } catch { }
             try { if (player != null) player.Mute = true; } catch { }
             try { player?.Stop(); } catch { }
-            try { media?.Dispose(); } catch { }
             try { player?.Dispose(); } catch { }
             try { vlc?.Dispose(); } catch { }
         })
@@ -396,6 +403,8 @@ public sealed class PlaybackController : IDisposable
         try { _watchdog?.Stop(); _watchdog?.Dispose(); } catch { }
         try { _workQueue.CompleteAdding(); } catch { }
         DisposeOnSacrificialThread(Player, _libVlc, _currentMedia);
+        try { _previousMediaPendingDispose?.Dispose(); } catch { }
+        _previousMediaPendingDispose = null;
     }
 
     // Some backends ignore volume writes while muted, so always unmute first,

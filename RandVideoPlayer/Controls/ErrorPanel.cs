@@ -7,6 +7,8 @@ namespace RandVideoPlayer.Controls;
 
 public sealed class ErrorPanel : UserControl, IThemedControl
 {
+    private const int MaxEntries = 1000;
+
     private readonly ListBox _list;
     private readonly Panel _header;
     private readonly Label _headerLabel;
@@ -61,6 +63,8 @@ public sealed class ErrorPanel : UserControl, IThemedControl
         void add()
         {
             _list.Items.Insert(0, line);
+            while (_list.Items.Count > MaxEntries)
+                _list.Items.RemoveAt(_list.Items.Count - 1);
             EntryLogged?.Invoke();
         }
         if (InvokeRequired) BeginInvoke(new Action(add));
