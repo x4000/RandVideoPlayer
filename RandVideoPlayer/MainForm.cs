@@ -36,6 +36,7 @@ public sealed class MainForm : Form
 
     private readonly System.Windows.Forms.Timer _uiTimer;
     private readonly System.Windows.Forms.Timer _positionSaveTimer;
+    private readonly System.Windows.Forms.Timer _memoryWatchdog;
 
     private FolderLibrary? _library;
     private ShuffleFile? _shuffle;
@@ -94,6 +95,17 @@ public sealed class MainForm : Form
     private const int PlaybackFailuresBeforeEscalation = 4;
     private const int PlaybackEscalationMinIntervalMs = 30_000;
     private const int MaxAutomaticPipelineRecyclesPerSession = 4;
+
+    private long _lastMemoryRecoveryTicks;
+    private long _lastMemoryLogTicks;
+    private bool _memoryRestartInProgress;
+    private const long MemoryRecoveryPrivateBytes = 1L * 1024L * 1024L * 1024L;
+    private const long MemoryEmergencyPrivateBytes = 4L * 1024L * 1024L * 1024L;
+    private const int MemoryRecoveryMinIntervalMs = 10 * 60 * 1000;
+    private const int MemoryLogMinIntervalMs = 5 * 60 * 1000;
+    private static readonly string DiagnosticLogPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "ArcenSettings", "RandVideoPlayer", "diagnostics.log");
 
     public MainForm(AppSettings settings)
     {
@@ -215,6 +227,11 @@ public sealed class MainForm : Form
 
         _positionSaveTimer = new System.Windows.Forms.Timer { Interval = 5000 };
         _positionSaveTimer.Tick += (_, __) => SavePositionState(withPositionMs: false);
+
+        _memoryWatchdog = new System.Windows.Forms.Timer { Interval = 60_000 };
+        _memoryWatchdog.Tick += (_, __) => CheckMemoryPressure();
+        _memoryWatchdog.Start();
+        WriteDiagnostic("app started: " + (DescribeProcessMemory()));
 
         _engineWatchdog = new System.Windows.Forms.Timer { Interval = 2000 };
         _engineWatchdog.Tick += (_, __) =>
@@ -939,18 +956,115 @@ public sealed class MainForm : Form
         catch (Exception ex) { _errorPanel.Log("Pipeline rebuild failed: " + ex.Message); return false; }
     }
 
+    private void CheckMemoryPressure()
+    {
+        if (IsDisposed) return;
+        var mem = CaptureProcessMemory();
+        if (mem == null) return;
+
+        long now = Environment.TickCount64;
+        long pressureBytes = Math.Max(mem.Value.PrivateBytes, mem.Value.WorkingSetBytes);
+        bool high = pressureBytes >= MemoryRecoveryPrivateBytes;
+        bool emergency = pressureBytes >= MemoryEmergencyPrivateBytes;
+        if (!high)
+        {
+            if (now - _lastMemoryLogTicks >= MemoryLogMinIntervalMs)
+            {
+                _lastMemoryLogTicks = now;
+                WriteDiagnostic("memory sample: " + FormatMemory(mem.Value));
+            }
+            return;
+        }
+
+        if (now - _lastMemoryRecoveryTicks < MemoryRecoveryMinIntervalMs) return;
+        _lastMemoryRecoveryTicks = now;
+        string context = $"memory pressure at index {_currentIndex}, file \"{Path.GetFileName(_currentFullPath ?? "")}\"";
+        _errorPanel.Log("High memory detected; restarting player process. " + FormatMemory(mem.Value));
+        WriteDiagnostic(context + ": " + FormatMemory(mem.Value));
+        RestartProcessForMemoryPressure(emergency);
+    }
+
+    private void RestartProcessForMemoryPressure(bool emergency)
+    {
+        if (_memoryRestartInProgress) return;
+        _memoryRestartInProgress = true;
+
+        try
+        {
+            if (_shuffle != null && _library != null && _currentIndex >= 0)
+            {
+                string skipped = _currentFullPath ?? "";
+                if (_currentIndex + 1 < _shuffle.Files.Count)
+                {
+                    _currentIndex++;
+                    _currentFullPath = _library.ToFull(_shuffle.Files[_currentIndex]);
+                    SavePositionState(withPositionMs: false);
+                    WriteDiagnostic("memory restart skipped suspect file: \"" + Path.GetFileName(skipped) + "\"; next index " + _currentIndex);
+                }
+                else
+                {
+                    SavePositionState(withPositionMs: false);
+                    WriteDiagnostic("memory restart at end of playlist; saved current index " + _currentIndex);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            WriteDiagnostic("memory restart position save failed: " + ex.Message);
+        }
+
+        try
+        {
+            var exe = Application.ExecutablePath;
+            WriteDiagnostic("starting replacement process: " + exe + (emergency ? " (emergency)" : ""));
+            Process.Start(new ProcessStartInfo { FileName = exe, UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            WriteDiagnostic("replacement process start failed: " + ex.Message);
+        }
+
+        Environment.Exit(99);
+    }
+
     private static string DescribeProcessMemory()
     {
         try
         {
-            using var p = Process.GetCurrentProcess();
-            return "Memory: working set "
-                + FormatBytes(p.WorkingSet64)
-                + ", private "
-                + FormatBytes(p.PrivateMemorySize64)
-                + ".";
+            var mem = CaptureProcessMemory();
+            return mem == null ? "" : "Memory: " + FormatMemory(mem.Value) + ".";
         }
         catch { return ""; }
+    }
+
+    private static (long WorkingSetBytes, long PrivateBytes, long VirtualBytes, int HandleCount, int ThreadCount)? CaptureProcessMemory()
+    {
+        try
+        {
+            using var p = Process.GetCurrentProcess();
+            return (p.WorkingSet64, p.PrivateMemorySize64, p.VirtualMemorySize64, p.HandleCount, p.Threads.Count);
+        }
+        catch { return null; }
+    }
+
+    private static string FormatMemory((long WorkingSetBytes, long PrivateBytes, long VirtualBytes, int HandleCount, int ThreadCount) mem)
+    {
+        return "working set " + FormatBytes(mem.WorkingSetBytes)
+            + ", private " + FormatBytes(mem.PrivateBytes)
+            + ", virtual " + FormatBytes(mem.VirtualBytes)
+            + ", handles " + mem.HandleCount
+            + ", threads " + mem.ThreadCount;
+    }
+
+    private static void WriteDiagnostic(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(DiagnosticLogPath)!);
+            File.AppendAllText(DiagnosticLogPath,
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + message + Environment.NewLine);
+        }
+        catch { }
     }
 
     private static string FormatBytes(long bytes)
@@ -1409,6 +1523,7 @@ public sealed class MainForm : Form
         try { UnregisterDisplayNotify(); } catch { }
         try { _uiTimer.Stop(); _uiTimer.Dispose(); } catch { }
         try { _positionSaveTimer.Stop(); _positionSaveTimer.Dispose(); } catch { }
+        try { _memoryWatchdog.Stop(); _memoryWatchdog.Dispose(); } catch { }
         try { StopWatcher(); } catch { }
         try { _displayRecoveryTimer?.Stop(); _displayRecoveryTimer?.Dispose(); } catch { }
         try { _detachedWindowAdoptionTimer?.Stop(); _detachedWindowAdoptionTimer?.Dispose(); } catch { }
