@@ -50,8 +50,14 @@ UI deliberately minimal compared to VLC itself.
   after the currently-playing track.
 - **Sidebar** with toggle between alphabetical view and shuffle-order view.
   Current track is highlighted. Double-click to jump. Right-click menu to
-  Reveal in Explorer, Delete (Recycle Bin), or Open in Bandicut (if
-  installed).
+  Reveal in Explorer, Delete (Recycle Bin), or Cut… (lossless).
+- **In-app lossless cut tool.** A pop-out trim window (right-click ▸ Cut…)
+  with a full-length In/Out bar plus a zoomed "magnifier" scrubber for
+  frame-precise seeking. Lossless stream-copy cutting by default (zero
+  quality loss; start snaps to a keyframe), or an optional frame-accurate
+  re-encode. Preview helpers: play-from-In, preview-end, and stop-at-Out.
+  Saves in place, moving the original to the Recycle Bin as a backup.
+  Requires a local `ffmpeg`/`ffprobe`.
 - **Header stats** show file count and aggregate total duration, computed in
   a background thread and cached in a hidden `.rvp_durations.json` per
   folder.
@@ -105,7 +111,7 @@ opened folder is re-opened automatically. Use **File → Open Folder** or
   shuffle order. Works when the cursor is over the app window.
 - **Double-click in sidebar** — play that file.
 - **Right-click in sidebar** — Play / Reveal in Explorer / Delete (Recycle
-  Bin) / Open in Bandicut.
+  Bin) / Cut… (lossless).
 - **Scroll wheel over volume slider** — adjust volume.
 
 ### Keyboard
@@ -163,10 +169,11 @@ Stored in `%AppData%\ArcenSettings\RandVideoPlayer\`:
 
 ## Third-party integrations
 
-- **Bandicut** — if Bandicut is installed (auto-detected from common install
-  paths and the registry), the sidebar's right-click menu gets an "Open in
-  Bandicut" entry that hands the file to Bandicut for editing. The entry is
-  greyed when Bandicut is absent.
+- **ffmpeg / ffprobe** — power the in-app cut tool. Auto-detected from the
+  winget "Links" shim directory, common install paths, and `PATH`. The
+  sidebar's "Cut…" entry is greyed when they are absent. Lossless cuts use
+  `ffmpeg -ss <keyframe> -i in -t <dur> -c copy`; the optional frame-accurate
+  mode re-encodes the selection at CRF 18.
 
 ---
 
@@ -184,7 +191,7 @@ Stored in `%AppData%\ArcenSettings\RandVideoPlayer\`:
 - `UI/` — theme palettes, dark-mode chrome helpers (DWM title bar +
   UxTheme scrollbars), low-level mouse hook.
 - `Integrations/` — shell-level helpers (Recycle Bin send, Explorer reveal)
-  and Bandicut detection/launch.
+  and ffmpeg/ffprobe detection + cut execution.
 - `AppState/AppSettings.cs` — two-file settings persistence with migration
   from older unified format.
 

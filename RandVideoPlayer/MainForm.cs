@@ -7,6 +7,8 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using RandVideoPlayer.AppState;
@@ -52,6 +54,7 @@ public sealed class MainForm : Form
 
     private Theme _theme = Theme.Dark;
     private readonly ThreadMouseHook _mouseHook = new();
+    private CutWindow? _cutWindow;
 
     // Display power-state recovery. When the monitors power off (idle timeout
     // or the panel dropping its DP/HDMI link) while the PC stays awake, the GPU
@@ -159,7 +162,7 @@ public sealed class MainForm : Form
         _sidebar.PlayRequested += path => PlayPath(path, saveState: true);
         _sidebar.RevealRequested += ShellOps.RevealInExplorer;
         _sidebar.DeleteRequested += HandleDeleteFromSidebar;
-        _sidebar.BandicutRequested += Bandicut.Open;
+        _sidebar.CutRequested += OpenCutWindow;
         _sidebar.ViewModeChanged += _ => { RefreshSidebar(); _sidebar.EnsureCurrentVisible(); };
 
         _errorPanel = new ErrorPanel { Visible = _settings.ErrorPanelVisible };
@@ -857,6 +860,219 @@ public sealed class MainForm : Form
             _errorPanel.Log("Recycle Bin delete failed: " + fullPath);
     }
 
+    // ---- In-app cut tool -----------------------------------------------------
+    // Opens the pop-out trim window. Preview reuses the MAIN player (so scrubbing
+    // rides the hardened libvlc pipeline); this window only collects In/Out and a
+    // lossless/re-encode choice and hands a CutRequest back to PerformCut.
+
+    private void OpenCutWindow(string path)
+    {
+        if (_library == null) return;
+        if (!Ffmpeg.IsAvailable)
+        {
+            MessageBox.Show(this,
+                "ffmpeg was not found on this system.\n\nInstall it (e.g. `winget install Gyan.FFmpeg`) to enable in-app cutting.",
+                "Cut", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (!File.Exists(path))
+        {
+            MessageBox.Show(this, "File not found:\n" + path, "Cut", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (_cutWindow != null && !_cutWindow.IsDisposed)
+        {
+            _cutWindow.Activate();
+            return;
+        }
+
+        // Preview reuses the main player, so the target must be what's loaded.
+        if (!string.Equals(_currentFullPath, path, StringComparison.OrdinalIgnoreCase))
+            PlayPath(path, saveState: true);
+
+        double fps = 30.0;
+        var info = Ffmpeg.Probe(path);
+        if (info != null && info.Fps > 1) fps = info.Fps;
+
+        var win = new CutWindow(
+            path, Path.GetFileName(path), _theme, fps,
+            getTimeMs: () => _playback.TimeMs,
+            getLengthMs: () => _playback.LengthMs,
+            seekMs: ms => _playback.TimeMs = ms,
+            togglePause: () => _playback.TogglePause(),
+            getIsPlaying: () => _playback.IsPlaying);
+        _cutWindow = win;
+        win.CutConfirmed += req => PerformCut(path, req, win);
+        win.FormClosed += (_, __) => { if (ReferenceEquals(_cutWindow, win)) _cutWindow = null; };
+        win.Show(this);
+
+        // Keyframe probing reads the whole packet index — do it off-thread and
+        // push the result into the window when it's ready.
+        Task.Run(() =>
+        {
+            var kf = Ffmpeg.GetKeyframes(path);
+            try { win.BeginInvoke(new Action(() => { if (!win.IsDisposed) win.SetKeyframes(kf); })); } catch { }
+        });
+    }
+
+    private void PerformCut(string path, CutRequest req, CutWindow win)
+    {
+        if (_library == null) return;
+
+        string modeDesc = req.Reencode
+            ? "Frame-accurate (re-encodes the selection — slight quality loss)."
+            : "Lossless (stream copy — zero quality loss; start snaps to a keyframe).";
+        var confirm = MessageBox.Show(this,
+            "Replace the original with the cut version?\n\n" + Path.GetFileName(path) + "\n\n" +
+            "Mode: " + modeDesc + "\n\nThe original is moved to the Recycle Bin as a backup.",
+            "Cut & Save", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+        if (confirm != DialogResult.OK) return;
+
+        double inSec = req.InMs / 1000.0;
+        double outSec = req.OutMs / 1000.0;
+        string dir = Path.GetDirectoryName(path) ?? "";
+        string name = Path.GetFileNameWithoutExtension(path);
+        string ext = Path.GetExtension(path);
+        string temp = Path.Combine(dir, name + ".rvpcut-tmp" + ext);
+
+        win.SetBusy(true, "Preparing…");
+
+        Task.Run(() =>
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+
+            void Prog(double f)
+            {
+                try { win.BeginInvoke(new Action(() => { if (!win.IsDisposed) win.ReportProgress(f); })); } catch { }
+            }
+
+            bool ok;
+            string err;
+            if (req.Reencode)
+            {
+                var pinfo = Ffmpeg.Probe(path);
+                string pix = pinfo?.PixFmt ?? "yuv420p";
+                ok = Ffmpeg.CutReencode(path, inSec, outSec, pix, temp, Prog, CancellationToken.None, out err);
+            }
+            else
+            {
+                var kfs = Ffmpeg.GetKeyframes(path);
+                double kfStart = Ffmpeg.KeyframeAtOrBefore(kfs, inSec);
+                double dur = Math.Max(0.05, outSec - kfStart);
+                ok = Ffmpeg.CutLossless(path, kfStart, dur, temp, Prog, CancellationToken.None, out err);
+            }
+
+            if (ok)
+            {
+                var vinfo = Ffmpeg.Probe(temp);
+                if (vinfo == null || !vinfo.HasVideo || vinfo.DurationSec < 0.05)
+                {
+                    ok = false;
+                    err = "Output verification failed (no video / zero duration).";
+                }
+            }
+
+            if (!ok)
+            {
+                try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+                try { win.BeginInvoke(new Action(() => { if (!win.IsDisposed) win.ReportDone(false, "Failed: " + Trunc(err)); })); } catch { }
+                return;
+            }
+
+            try { BeginInvoke(new Action(() => FinishCutSwap(path, temp, win))); } catch { }
+        });
+    }
+
+    // The output is ready and verified. Release libvlc's handle on the file (it
+    // keeps the currently-playing file open), THEN swap it in. Mirrors the delete
+    // path: Stop, wait for the queued work to drain, then touch the file.
+    private void FinishCutSwap(string path, string temp, CutWindow win)
+    {
+        if (!win.IsDisposed) win.SetBusy(true, "Saving…");
+        bool isCurrent = string.Equals(_currentFullPath, path, StringComparison.OrdinalIgnoreCase);
+        if (isCurrent)
+        {
+            try { _playback.Stop(); } catch { }
+            _playback.RunAfterPendingWork(() => BackgroundSwap(path, temp, win, wasCurrent: true));
+        }
+        else
+        {
+            BackgroundSwap(path, temp, win, wasCurrent: false);
+        }
+    }
+
+    // The rename/move can briefly hit a sharing violation while libvlc finishes
+    // releasing the handle, so the retry loop runs OFF the UI thread. Only the
+    // reload + status report marshal back.
+    private void BackgroundSwap(string path, string temp, CutWindow win, bool wasCurrent)
+    {
+        string dir = Path.GetDirectoryName(path) ?? "";
+        string name = Path.GetFileNameWithoutExtension(path);
+        string ext = Path.GetExtension(path);
+        string bak = Path.Combine(dir, name + ".rvpcut-bak" + ext);
+
+        Task.Run(() =>
+        {
+            bool ok = SwapInPlace(path, temp, bak, out string err);
+            bool recycledBak = ok && File.Exists(bak) && ShellOps.SendToRecycleBin(bak);
+
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    if (ok)
+                    {
+                        if (!recycledBak) _errorPanel.Log("Cut: backup not sent to Recycle Bin: " + bak);
+                        if (wasCurrent) PlayPath(path, saveState: false);
+                        _errorPanel.Log("Cut saved (original in Recycle Bin): " + Path.GetFileName(path));
+                        if (!win.IsDisposed) win.ReportDone(true, "Saved.");
+                    }
+                    else
+                    {
+                        try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+                        if (wasCurrent && File.Exists(path)) PlayPath(path, saveState: false);
+                        if (!win.IsDisposed) win.ReportDone(false, "Save failed: " + Trunc(err));
+                    }
+                }));
+            }
+            catch { }
+        });
+    }
+
+    // original -> backup, temp -> original. On failure the original is restored
+    // from the backup so the library file is never lost.
+    private static bool SwapInPlace(string original, string temp, string backup, out string err)
+    {
+        err = "";
+        try { if (File.Exists(backup)) File.Delete(backup); } catch { }
+
+        if (!TryMoveWithRetry(original, backup, out err)) return false;
+
+        try { File.Move(temp, original); }
+        catch (Exception ex)
+        {
+            err = ex.Message;
+            try { if (!File.Exists(original) && File.Exists(backup)) File.Move(backup, original); } catch { }
+            return false;
+        }
+        return true;
+    }
+
+    private static bool TryMoveWithRetry(string from, string to, out string err)
+    {
+        err = "";
+        for (int attempt = 0; attempt < 20; attempt++)
+        {
+            try { File.Move(from, to); return true; }
+            catch (IOException ex) { err = ex.Message; Thread.Sleep(100); }
+            catch (UnauthorizedAccessException ex) { err = ex.Message; Thread.Sleep(100); }
+        }
+        return false;
+    }
+
+    private static string Trunc(string s)
+        => string.IsNullOrEmpty(s) ? "unknown error" : (s.Length > 300 ? s.Substring(0, 300) + "…" : s);
+
     private void SavePositionState(bool withPositionMs)
     {
         if (_library == null || _shuffle == null) return;
@@ -1095,6 +1311,7 @@ public sealed class MainForm : Form
         _sidebar.ApplyTheme(_theme);
         _errorPanel.ApplyTheme(_theme);
         _videoHost.BackColor = Color.Black;
+        if (_cutWindow != null && !_cutWindow.IsDisposed) _cutWindow.ApplyTheme(_theme);
 
         // Native chrome (title bar + scrollbars) — Windows-only dark-mode hooks.
         if (IsHandleCreated)

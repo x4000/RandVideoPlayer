@@ -20,7 +20,7 @@ public sealed class Sidebar : UserControl, IThemedControl
     public event Action<string>? PlayRequested;
     public event Action<string>? RevealRequested;
     public event Action<string>? DeleteRequested;
-    public event Action<string>? BandicutRequested;
+    public event Action<string>? CutRequested;
     public event Action<ViewMode>? ViewModeChanged;
 
     private Theme _theme = Theme.Dark;
@@ -105,21 +105,21 @@ public sealed class Sidebar : UserControl, IThemedControl
         var miPlay = new ToolStripMenuItem("Play");
         var miReveal = new ToolStripMenuItem("Reveal in Explorer");
         var miDelete = new ToolStripMenuItem("Delete (Recycle Bin)");
-        var miBandicut = new ToolStripMenuItem("Open in Bandicut");
-        menu.Items.AddRange(new ToolStripItem[] { miPlay, miReveal, miDelete, new ToolStripSeparator(), miBandicut });
+        var miCut = new ToolStripMenuItem("Cut… (lossless)");
+        menu.Items.AddRange(new ToolStripItem[] { miPlay, miReveal, miDelete, new ToolStripSeparator(), miCut });
         menu.Opening += (s, e) =>
         {
             bool has = List.SelectedItems.Count > 0 && List.SelectedItems[0].Tag is string;
             miPlay.Enabled = miReveal.Enabled = miDelete.Enabled = has;
-            miBandicut.Enabled = has && Bandicut.IsInstalled;
-            miBandicut.Text = Bandicut.IsInstalled ? "Open in Bandicut" : "Open in Bandicut (not installed)";
+            miCut.Enabled = has && Ffmpeg.IsAvailable;
+            miCut.Text = Ffmpeg.IsAvailable ? "Cut… (lossless)" : "Cut… (ffmpeg not found)";
             if (!has) e.Cancel = true;
         };
         string? SelectedPath() => List.SelectedItems.Count > 0 && List.SelectedItems[0].Tag is string s ? s : null;
         miPlay.Click += (_, __) => { var p = SelectedPath(); if (p != null) PlayRequested?.Invoke(p); };
         miReveal.Click += (_, __) => { var p = SelectedPath(); if (p != null) RevealRequested?.Invoke(p); };
         miDelete.Click += (_, __) => { var p = SelectedPath(); if (p != null) DeleteRequested?.Invoke(p); };
-        miBandicut.Click += (_, __) => { var p = SelectedPath(); if (p != null) BandicutRequested?.Invoke(p); };
+        miCut.Click += (_, __) => { var p = SelectedPath(); if (p != null) CutRequested?.Invoke(p); };
         List.ContextMenuStrip = menu;
 
         Controls.Add(List);
