@@ -10,22 +10,38 @@ namespace RandVideoPlayer.Controls;
 
 public sealed class Sidebar : UserControl, IThemedControl
 {
-    public enum ViewMode { Alphabetical, ShuffleOrder }
+    public enum ViewMode { Search, ShuffleOrder, Favorites }
 
     public ListView List { get; }
-    public Button AlphaBtn { get; }
+    public Button SearchBtn { get; }
     public Button ShuffleBtn { get; }
+    public FavoritesButton FavoritesBtn { get; }
     public Label StatsLabel { get; }
+    public TextBox SearchBox { get; }
 
     public event Action<string>? PlayRequested;
     public event Action<string>? RevealRequested;
     public event Action<string>? DeleteRequested;
     public event Action<string>? CutRequested;
     public event Action<ViewMode>? ViewModeChanged;
+    public event Action? SearchTextChanged;
+    public event Action<string>? AddFavoriteRequested;
+    public event Action<string>? RemoveFavoriteRequested;
+    // (dragged file, index it should occupy in the pre-move list)
+    public event Action<string, int>? FavoriteMoveRequested;
+
+    // Set by the host so the context menu can offer add-vs-remove correctly.
+    public Func<string, bool>? IsFavorite { get; set; }
 
     private Theme _theme = Theme.Dark;
     private ViewMode _mode = ViewMode.ShuffleOrder;
     private string? _currentFullPath;
+    private readonly Panel _tabs;
+    private readonly Panel _searchPanel;
+    private readonly System.Windows.Forms.Timer _searchDebounce;
+    // Row index the pending drag would insert before; == Items.Count means "at
+    // the end". -1 when no drag is in flight.
+    private int _dropIndex = -1;
 
     public ViewMode Mode
     {
@@ -34,26 +50,38 @@ public sealed class Sidebar : UserControl, IThemedControl
         {
             if (_mode == value) return;
             _mode = value;
+            _searchPanel.Visible = _mode == ViewMode.Search;
+            _dropIndex = -1;
             UpdateToggleAppearance();
             ViewModeChanged?.Invoke(_mode);
+            if (_mode == ViewMode.Search && IsHandleCreated)
+            {
+                try { SearchBox.Focus(); SearchBox.SelectAll(); } catch { }
+            }
         }
     }
+
+    public string SearchText => SearchBox.Text.Trim();
 
     public Sidebar()
     {
         Width = 320;
         Dock = DockStyle.Right;
 
-        // Tabs header
-        var tabs = new Panel { Dock = DockStyle.Top, Height = 34 };
-        AlphaBtn = MakeTabButton("Alphabetical");
-        ShuffleBtn = MakeTabButton("Shuffled List");
-        AlphaBtn.Dock = DockStyle.Left;
-        ShuffleBtn.Dock = DockStyle.Left;
-        AlphaBtn.Click += (_, __) => Mode = ViewMode.Alphabetical;
+        // Tabs header. Widths are split evenly on resize rather than fixed, so
+        // three labels still fit when the sidebar is narrow.
+        _tabs = new Panel { Dock = DockStyle.Top, Height = 34 };
+        SearchBtn = MakeTabButton("Search");
+        ShuffleBtn = MakeTabButton("Shuffled");
+        FavoritesBtn = MakeFavoritesTabButton();
+        SearchBtn.Click += (_, __) => Mode = ViewMode.Search;
         ShuffleBtn.Click += (_, __) => Mode = ViewMode.ShuffleOrder;
-        tabs.Controls.Add(ShuffleBtn);
-        tabs.Controls.Add(AlphaBtn);
+        FavoritesBtn.Click += (_, __) => Mode = ViewMode.Favorites;
+        // Add right-to-left: each Dock=Left control stacks after the previous.
+        _tabs.Controls.Add(FavoritesBtn);
+        _tabs.Controls.Add(ShuffleBtn);
+        _tabs.Controls.Add(SearchBtn);
+        _tabs.Resize += (_, __) => LayoutTabs();
 
         // Stats row
         var statsPanel = new Panel { Dock = DockStyle.Top, Height = 22 };
@@ -67,6 +95,20 @@ public sealed class Sidebar : UserControl, IThemedControl
         };
         statsPanel.Controls.Add(StatsLabel);
 
+        // Search row — only shown on the Search tab.
+        _searchPanel = new Panel { Dock = DockStyle.Top, Height = 28, Padding = new Padding(6, 2, 6, 4), Visible = false };
+        SearchBox = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            BorderStyle = BorderStyle.FixedSingle,
+            Font = new Font("Segoe UI", 9f),
+            PlaceholderText = "Filter by name…"
+        };
+        _searchDebounce = new System.Windows.Forms.Timer { Interval = 180 };
+        _searchDebounce.Tick += (_, __) => { _searchDebounce.Stop(); SearchTextChanged?.Invoke(); };
+        SearchBox.TextChanged += (_, __) => { _searchDebounce.Stop(); _searchDebounce.Start(); };
+        _searchPanel.Controls.Add(SearchBox);
+
         // List
         List = new ListView
         {
@@ -79,7 +121,8 @@ public sealed class Sidebar : UserControl, IThemedControl
             Font = new Font("Segoe UI", 9f),
             BorderStyle = BorderStyle.None,
             OwnerDraw = true,
-            ShowItemToolTips = true
+            ShowItemToolTips = true,
+            AllowDrop = true
         };
         List.Columns.Add("#", 58);
         List.Columns.Add("File", 240);
@@ -101,16 +144,75 @@ public sealed class Sidebar : UserControl, IThemedControl
             }
         };
 
+        // Wired here rather than with the rest of the search box because it
+        // reaches into the list, which does not exist until now.
+        SearchBox.KeyDown += (s, e) =>
+        {
+            if (e.KeyCode == Keys.Escape)
+            {
+                if (SearchBox.Text.Length > 0) SearchBox.Clear();
+                e.Handled = e.SuppressKeyPress = true;
+            }
+            else if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Down)
+            {
+                // Commit any pending debounce so the list we jump into is current.
+                if (_searchDebounce.Enabled) { _searchDebounce.Stop(); SearchTextChanged?.Invoke(); }
+                if (List.Items.Count > 0)
+                {
+                    List.Focus();
+                    List.Items[0].Selected = true;
+                    try { List.Items[0].EnsureVisible(); } catch { }
+                }
+                e.Handled = e.SuppressKeyPress = true;
+            }
+        };
+
+        // Dragging a row does two things depending on where it lands: inside the
+        // favorites list it reorders (only that tab is an ordered, editable
+        // list); onto the Favorites tab button, from any tab, it favorites.
+        List.ItemDrag += (s, e) =>
+        {
+            if (e.Item is ListViewItem lvi && lvi.Tag is string p)
+                List.DoDragDrop(p, DragDropEffects.Move | DragDropEffects.Copy);
+        };
+        List.DragEnter += (s, e) => e.Effect = DragEffectFor(e);
+        List.DragOver += (s, e) =>
+        {
+            e.Effect = DragEffectFor(e);
+            int idx = e.Effect == DragDropEffects.Move ? DropIndexAt(e.X, e.Y) : -1;
+            if (idx != _dropIndex) { _dropIndex = idx; List.Invalidate(); }
+        };
+        List.DragLeave += (s, e) => { if (_dropIndex != -1) { _dropIndex = -1; List.Invalidate(); } };
+        List.DragDrop += (s, e) =>
+        {
+            int target = _dropIndex;
+            _dropIndex = -1;
+            List.Invalidate();
+            if (_mode != ViewMode.Favorites || target < 0) return;
+            if (e.Data?.GetData(typeof(string)) is string p) FavoriteMoveRequested?.Invoke(p, target);
+        };
+
         var menu = new ContextMenuStrip();
         var miPlay = new ToolStripMenuItem("Play");
         var miReveal = new ToolStripMenuItem("Reveal in Explorer");
         var miDelete = new ToolStripMenuItem("Delete (Recycle Bin)");
+        var miAddFav = new ToolStripMenuItem("Add to Favorites");
+        var miRemoveFav = new ToolStripMenuItem("Remove from Favorites");
         var miCut = new ToolStripMenuItem("Cut… (lossless)");
-        menu.Items.AddRange(new ToolStripItem[] { miPlay, miReveal, miDelete, new ToolStripSeparator(), miCut });
+        menu.Items.AddRange(new ToolStripItem[]
+        {
+            miPlay, miReveal, miDelete,
+            new ToolStripSeparator(), miAddFav, miRemoveFav,
+            new ToolStripSeparator(), miCut
+        });
         menu.Opening += (s, e) =>
         {
-            bool has = List.SelectedItems.Count > 0 && List.SelectedItems[0].Tag is string;
+            var path = SelectedPath();
+            bool has = path != null;
             miPlay.Enabled = miReveal.Enabled = miDelete.Enabled = has;
+            bool isFav = has && (IsFavorite?.Invoke(path!) ?? false);
+            miAddFav.Visible = has && !isFav;
+            miRemoveFav.Visible = has && isFav;
             miCut.Enabled = has && Ffmpeg.IsAvailable;
             miCut.Text = Ffmpeg.IsAvailable ? "Cut… (lossless)" : "Cut… (ffmpeg not found)";
             if (!has) e.Cancel = true;
@@ -119,25 +221,73 @@ public sealed class Sidebar : UserControl, IThemedControl
         miPlay.Click += (_, __) => { var p = SelectedPath(); if (p != null) PlayRequested?.Invoke(p); };
         miReveal.Click += (_, __) => { var p = SelectedPath(); if (p != null) RevealRequested?.Invoke(p); };
         miDelete.Click += (_, __) => { var p = SelectedPath(); if (p != null) DeleteRequested?.Invoke(p); };
+        miAddFav.Click += (_, __) => { var p = SelectedPath(); if (p != null) AddFavoriteRequested?.Invoke(p); };
+        miRemoveFav.Click += (_, __) => { var p = SelectedPath(); if (p != null) RemoveFavoriteRequested?.Invoke(p); };
         miCut.Click += (_, __) => { var p = SelectedPath(); if (p != null) CutRequested?.Invoke(p); };
         List.ContextMenuStrip = menu;
 
         Controls.Add(List);
+        Controls.Add(_searchPanel);
         Controls.Add(statsPanel);
-        Controls.Add(tabs);
+        Controls.Add(_tabs);
 
         ApplyTheme(_theme);
         UpdateToggleAppearance();
+        LayoutTabs();
     }
 
-    private Button MakeTabButton(string text) => new Button
+    private Button MakeTabButton(string text) => new()
     {
         Text = text,
-        Width = 130,
+        Width = 106,
+        Dock = DockStyle.Left,
         FlatStyle = FlatStyle.Flat,
         Font = new Font("Segoe UI", 9f),
         TabStop = false
     };
+
+    private FavoritesButton MakeFavoritesTabButton() => new()
+    {
+        Text = "Favorites",
+        Width = 106,
+        Dock = DockStyle.Left,
+        FlatStyle = FlatStyle.Flat,
+        Font = new Font("Segoe UI", 9f),
+        TabStop = false
+    };
+
+    private void LayoutTabs()
+    {
+        int total = _tabs.ClientSize.Width;
+        if (total <= 0) return;
+        int each = total / 3;
+        SearchBtn.Width = each;
+        ShuffleBtn.Width = each;
+        // Last one absorbs the rounding remainder.
+        FavoritesBtn.Width = Math.Max(each, total - 2 * each);
+    }
+
+    private DragDropEffects DragEffectFor(DragEventArgs e)
+    {
+        if (_mode != ViewMode.Favorites) return DragDropEffects.None;
+        return e.Data?.GetDataPresent(typeof(string)) == true ? DragDropEffects.Move : DragDropEffects.None;
+    }
+
+    // Screen coords -> the slot the row would land in. Above the midpoint of a
+    // row means "before it", below means "after it".
+    private int DropIndexAt(int screenX, int screenY)
+    {
+        var pt = List.PointToClient(new Point(screenX, screenY));
+        if (List.Items.Count == 0) return 0;
+        var hit = List.GetItemAt(4, pt.Y);
+        if (hit == null)
+        {
+            // Above the first row, or in the empty space past the last one.
+            return pt.Y < List.Items[0].Bounds.Top ? 0 : List.Items.Count;
+        }
+        var b = hit.Bounds;
+        return pt.Y < b.Top + b.Height / 2 ? hit.Index : hit.Index + 1;
+    }
 
     private void DrawSubItem(object? sender, DrawListViewSubItemEventArgs e)
     {
@@ -167,6 +317,20 @@ public sealed class Sidebar : UserControl, IThemedControl
             textRect.Width -= 8;
         }
         TextRenderer.DrawText(e.Graphics, e.SubItem.Text, List.Font, textRect, fore, flags);
+
+        // Drop indicator for a favorites reorder. ListView.InsertionMark only
+        // renders in icon views, so draw the line ourselves.
+        if (_dropIndex >= 0)
+        {
+            bool lineAbove = e.ItemIndex == _dropIndex;
+            bool lineBelow = _dropIndex >= List.Items.Count && e.ItemIndex == List.Items.Count - 1;
+            if (lineAbove || lineBelow)
+            {
+                int y = lineAbove ? e.Bounds.Top : e.Bounds.Bottom - 2;
+                using var pen = new Pen(_theme.Accent, 2);
+                e.Graphics.DrawLine(pen, e.Bounds.Left, y + 1, e.Bounds.Right, y + 1);
+            }
+        }
     }
 
     public void ApplyTheme(Theme theme)
@@ -177,15 +341,16 @@ public sealed class Sidebar : UserControl, IThemedControl
         {
             if (c is Panel p) p.BackColor = theme.PanelAlt;
         }
-        AlphaBtn.ForeColor = theme.Text;
-        ShuffleBtn.ForeColor = theme.Text;
         StatsLabel.ForeColor = theme.TextMuted;
         StatsLabel.BackColor = theme.PanelAlt;
-        foreach (var b in new[] { AlphaBtn, ShuffleBtn })
+        foreach (var b in TabButtons())
         {
             b.FlatAppearance.BorderSize = 0;
             b.BackColor = theme.PanelAlt;
+            b.ForeColor = theme.Text;
         }
+        SearchBox.BackColor = theme.Background;
+        SearchBox.ForeColor = theme.Text;
         List.BackColor = theme.Background;
         List.ForeColor = theme.Text;
         UpdateToggleAppearance();
@@ -193,12 +358,19 @@ public sealed class Sidebar : UserControl, IThemedControl
         Invalidate(true);
     }
 
+    private IEnumerable<Button> TabButtons()
+    {
+        yield return SearchBtn;
+        yield return ShuffleBtn;
+        yield return FavoritesBtn;
+    }
+
     private void UpdateToggleAppearance()
     {
-        AlphaBtn.BackColor = _mode == ViewMode.Alphabetical ? _theme.ButtonActive : _theme.PanelAlt;
+        SearchBtn.BackColor = _mode == ViewMode.Search ? _theme.ButtonActive : _theme.PanelAlt;
         ShuffleBtn.BackColor = _mode == ViewMode.ShuffleOrder ? _theme.ButtonActive : _theme.PanelAlt;
-        AlphaBtn.ForeColor = _theme.Text;
-        ShuffleBtn.ForeColor = _theme.Text;
+        FavoritesBtn.BackColor = _mode == ViewMode.Favorites ? _theme.ButtonActive : _theme.PanelAlt;
+        foreach (var b in TabButtons()) b.ForeColor = _theme.Text;
     }
 
     // Size the file column so the two columns together exactly fill the client
@@ -242,14 +414,16 @@ public sealed class Sidebar : UserControl, IThemedControl
         }
         List.EndUpdate();
         ResizeColumns();
-        EnsureCurrentVisible();
+        // Chasing the playing file makes sense for the ordered lists; in search
+        // the user is looking at their own query results, so leave the scroll be.
+        if (_mode != ViewMode.Search) EnsureCurrentVisible();
     }
 
     public void HighlightPath(string? fullPath)
     {
         _currentFullPath = fullPath;
         List.Invalidate();
-        EnsureCurrentVisible();
+        if (_mode != ViewMode.Search) EnsureCurrentVisible();
     }
 
     public void EnsureCurrentVisible()
@@ -266,6 +440,13 @@ public sealed class Sidebar : UserControl, IThemedControl
         }
     }
 
+    // Shown on the tab itself so favoriting from another tab (via the context
+    // menu, or by dropping a row onto this button) is visibly acknowledged.
+    public void SetFavoritesCount(int count)
+    {
+        FavoritesBtn.Text = count > 0 ? $"Favorites ({count})" : "Favorites";
+    }
+
     public void SetStats(int count, long totalMs, bool scanning, int scanned)
     {
         string durText;
@@ -279,5 +460,41 @@ public sealed class Sidebar : UserControl, IThemedControl
         }
         string scanText = scanning ? $"  (scanning {scanned}/{count})" : "";
         StatsLabel.Text = $"{count:N0} files · {durText}{scanText}";
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { try { _searchDebounce.Dispose(); } catch { } }
+        base.Dispose(disposing);
+    }
+}
+
+// A tab button that also accepts favorites dropped onto it, so a file can be
+// favorited by dragging it over from the search or shuffle list.
+public sealed class FavoritesButton : Button
+{
+    public event Action<string>? FileDropped;
+
+    public FavoritesButton()
+    {
+        AllowDrop = true;
+    }
+
+    protected override void OnDragEnter(DragEventArgs e)
+    {
+        e.Effect = e.Data?.GetDataPresent(typeof(string)) == true ? DragDropEffects.Copy : DragDropEffects.None;
+        base.OnDragEnter(e);
+    }
+
+    protected override void OnDragOver(DragEventArgs e)
+    {
+        e.Effect = e.Data?.GetDataPresent(typeof(string)) == true ? DragDropEffects.Copy : DragDropEffects.None;
+        base.OnDragOver(e);
+    }
+
+    protected override void OnDragDrop(DragEventArgs e)
+    {
+        if (e.Data?.GetData(typeof(string)) is string p) FileDropped?.Invoke(p);
+        base.OnDragDrop(e);
     }
 }

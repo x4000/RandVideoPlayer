@@ -43,7 +43,18 @@ public sealed class MainForm : Form
     private FolderLibrary? _library;
     private ShuffleFile? _shuffle;
     private DurationIndex? _durations;
+
+    // What the "next track" means right now. Shuffle is home; the other two are
+    // excursions the user launches from a sidebar tab, and both hand control
+    // back to the shuffle list (at the exact spot it was interrupted) when they
+    // run out. _currentIndex therefore always refers to the SHUFFLE list and is
+    // never disturbed by playing something from Search or Favorites.
+    private enum PlayContext { Shuffle, OneShot, Favorites }
+    private PlayContext _context = PlayContext.Shuffle;
     private int _currentIndex = -1;
+    private List<string> _favorites = new();   // relative paths, user-ordered
+    private int _favIndex = -1;
+    private long _shuffleReturnMs;             // playhead of the interrupted shuffle track
     private string? _currentFullPath;
     private long _resumePositionMs = 0;
     private bool _resumeApplied = true;
@@ -158,12 +169,18 @@ public sealed class MainForm : Form
         _videoHost.VideoView.Resize += (_, __) => FitAdoptedVideoWindows();
 
         _sidebar = new Sidebar { Visible = _settings.SidebarVisible };
-        _sidebar.Mode = _settings.SidebarShowShuffleOrder ? Sidebar.ViewMode.ShuffleOrder : Sidebar.ViewMode.Alphabetical;
-        _sidebar.PlayRequested += path => PlayPath(path, saveState: true);
+        _sidebar.Mode = ParseSidebarTab(_settings.SidebarTab);
+        _sidebar.IsFavorite = IsFavoritePath;
+        _sidebar.PlayRequested += PlayFromSidebar;
         _sidebar.RevealRequested += ShellOps.RevealInExplorer;
         _sidebar.DeleteRequested += HandleDeleteFromSidebar;
         _sidebar.CutRequested += OpenCutWindow;
         _sidebar.ViewModeChanged += _ => { RefreshSidebar(); _sidebar.EnsureCurrentVisible(); };
+        _sidebar.SearchTextChanged += () => { if (_sidebar.Mode == Sidebar.ViewMode.Search) RefreshSidebar(); };
+        _sidebar.AddFavoriteRequested += AddFavorite;
+        _sidebar.FavoritesBtn.FileDropped += AddFavorite;
+        _sidebar.RemoveFavoriteRequested += RemoveFavorite;
+        _sidebar.FavoriteMoveRequested += MoveFavorite;
 
         _errorPanel = new ErrorPanel { Visible = _settings.ErrorPanelVisible };
 
@@ -489,6 +506,11 @@ public sealed class MainForm : Form
             _settings.Save();
             RebuildRecentMenu();
 
+            _favorites = PlaylistState.LoadFavorites(folder)?.Files ?? new List<string>();
+            _favIndex = -1;
+            _context = PlayContext.Shuffle;
+            _shuffleReturnMs = 0;
+
             var existing = PlaylistState.LoadShuffle(folder);
             if (existing != null && ShuffleStillMatches(existing, _library))
             {
@@ -500,6 +522,7 @@ public sealed class MainForm : Form
                 _shuffle = CreateFreshShuffle(folder, _library);
                 PlaylistState.SaveShuffle(folder, _shuffle);
             }
+            PruneFavoritesToLibrary();
 
             var pos = PlaylistState.LoadPosition(folder);
             _currentIndex = -1;
@@ -531,8 +554,8 @@ public sealed class MainForm : Form
             UpdateNowPlayingLabel();
             UpdateWindowTitle();
 
-            if (_currentFullPath != null && File.Exists(_currentFullPath))
-                PlayPath(_currentFullPath, saveState: false);
+            if (_currentIndex >= 0 && _currentFullPath != null && File.Exists(_currentFullPath))
+                PlayShuffleAt(_currentIndex, _resumePositionMs, saveState: false);
         }
         catch (Exception ex)
         {
@@ -607,28 +630,34 @@ public sealed class MainForm : Form
         if (_shuffle == null || _library == null) return;
         int idx = _shuffle.Files.FindIndex(s => string.Equals(s, relativePath, StringComparison.OrdinalIgnoreCase));
         if (idx < 0) return;
-        bool wasCurrent = idx == _currentIndex;
+        // Only "current" in the sense that matters if the shuffle list is what
+        // is actually driving playback right now.
+        bool wasCurrent = idx == _currentIndex && _context == PlayContext.Shuffle;
         _shuffle.Files.RemoveAt(idx);
         if (idx < _currentIndex) _currentIndex--;
         else if (idx == _currentIndex)
         {
             _currentIndex = Math.Min(_currentIndex, _shuffle.Files.Count - 1);
-            _currentFullPath = _currentIndex >= 0 ? _library.ToFull(_shuffle.Files[_currentIndex]) : null;
+            if (_context == PlayContext.Shuffle)
+                _currentFullPath = _currentIndex >= 0 ? _library.ToFull(_shuffle.Files[_currentIndex]) : null;
+            else
+                _shuffleReturnMs = 0;   // that playhead belonged to the file we just dropped
         }
         if (logWhy != null) _errorPanel.Log(logWhy);
-        if (wasCurrent && _currentIndex >= 0 && _currentFullPath != null)
-            PlayPath(_currentFullPath, saveState: true);
+        if (wasCurrent && _currentIndex >= 0)
+            PlayShuffleAt(_currentIndex);
     }
 
-    private void PlayPath(string fullPath, bool saveState)
+    // ---- Playback contexts ---------------------------------------------------
+    // Every route into playback goes through one of PlayShuffleAt / PlayOneShot /
+    // PlayFavoriteAt so that _context, _currentIndex and _favIndex can never
+    // disagree with what is on screen.
+
+    private void StartPlayback(string fullPath, long resumeMs, bool saveState)
     {
-        if (_library == null || _shuffle == null) return;
-        var rel = _library.ToRelative(fullPath);
-        int idx = _shuffle.Files.FindIndex(s => string.Equals(s, rel, StringComparison.OrdinalIgnoreCase));
-        if (idx >= 0) _currentIndex = idx;
-        else _errorPanel.Log("Played ad-hoc file not in shuffle: " + rel);
         _currentFullPath = fullPath;
-        _resumeApplied = true;
+        _resumePositionMs = Math.Max(0, resumeMs);
+        _resumeApplied = _resumePositionMs <= 0;
         _playback.Play(fullPath);
         _positionSaveTimer.Stop();
         _positionSaveTimer.Start();
@@ -638,23 +667,124 @@ public sealed class MainForm : Form
         _sidebar.HighlightPath(fullPath);
     }
 
+    private void PlayShuffleAt(int idx, long resumeMs = 0, bool saveState = true)
+    {
+        if (_library == null || _shuffle == null) return;
+        if (idx < 0 || idx >= _shuffle.Files.Count) return;
+        _context = PlayContext.Shuffle;
+        _favIndex = -1;
+        _shuffleReturnMs = 0;
+        _currentIndex = idx;
+        StartPlayback(_library.ToFull(_shuffle.Files[idx]), resumeMs, saveState);
+    }
+
+    // Mark where the shuffle list was so an excursion can hand control back to
+    // the exact moment it interrupted. Only the FIRST departure marks it —
+    // hopping favorite-to-favorite must not overwrite the original spot.
+    private void MarkShuffleReturnPoint()
+    {
+        if (_context != PlayContext.Shuffle) return;
+        _shuffleReturnMs = _playback.IsPlaying ? _playback.TimeMs : 0;
+    }
+
+    // Search-tab play: this file and nothing else, then back to the shuffle.
+    private void PlayOneShot(string fullPath)
+    {
+        MarkShuffleReturnPoint();
+        _context = PlayContext.OneShot;
+        _favIndex = -1;
+        StartPlayback(fullPath, 0, saveState: true);
+    }
+
+    private void PlayFavoriteAt(int i)
+    {
+        if (_library == null || i < 0 || i >= _favorites.Count) return;
+        MarkShuffleReturnPoint();
+        _context = PlayContext.Favorites;
+        _favIndex = i;
+        StartPlayback(_library.ToFull(_favorites[i]), 0, saveState: true);
+    }
+
+    private void ReturnToShuffle()
+    {
+        _context = PlayContext.Shuffle;
+        _favIndex = -1;
+        if (_library == null || _shuffle == null || _shuffle.Files.Count == 0) return;
+
+        long resume = _shuffleReturnMs;
+        int idx = _currentIndex;
+        if (idx < 0 || idx >= _shuffle.Files.Count) { idx = 0; resume = 0; }
+        var full = _library.ToFull(_shuffle.Files[idx]);
+        if (!File.Exists(full))
+        {
+            // The track we were going to hand back to is gone; carry on down the list.
+            _currentIndex = idx;
+            _shuffleReturnMs = 0;
+            GoNext();
+            return;
+        }
+        PlayShuffleAt(idx, resume);
+    }
+
+    // Re-load the file that is already current because its bytes changed on
+    // disk (the cut tool swapping in a trimmed version). Deliberately leaves
+    // _context/_currentIndex/_favIndex alone — nothing about the queue moved.
+    private void ReloadCurrentFile(string path) => StartPlayback(path, 0, saveState: false);
+
+    private void PlayFromSidebar(string fullPath)
+    {
+        if (_library == null || _shuffle == null) return;
+        switch (_sidebar.Mode)
+        {
+            case Sidebar.ViewMode.Favorites:
+            {
+                int i = FavoriteIndexOf(fullPath);
+                if (i >= 0) PlayFavoriteAt(i); else PlayOneShot(fullPath);
+                break;
+            }
+            case Sidebar.ViewMode.ShuffleOrder:
+            {
+                var rel = _library.ToRelative(fullPath);
+                int i = _shuffle.Files.FindIndex(s => string.Equals(s, rel, StringComparison.OrdinalIgnoreCase));
+                if (i >= 0) PlayShuffleAt(i); else PlayOneShot(fullPath);
+                break;
+            }
+            default:
+                // Search is stateless: play exactly this, then resume the shuffle.
+                PlayOneShot(fullPath);
+                break;
+        }
+    }
+
     private void GoPrev()
     {
-        if (_shuffle == null || _library == null || _shuffle.Files.Count == 0) return;
+        if (_shuffle == null || _library == null) return;
+        if (_context == PlayContext.OneShot) { ReturnToShuffle(); return; }
+        if (_context == PlayContext.Favorites)
+        {
+            if (_favIndex > 0) PlayFavoriteAt(_favIndex - 1);
+            else SystemSounds.Beep();
+            return;
+        }
+        if (_shuffle.Files.Count == 0) return;
         if (_currentIndex <= 0) { SystemSounds.Beep(); return; }
-        _currentIndex--;
-        _currentFullPath = _library.ToFull(_shuffle.Files[_currentIndex]);
-        PlayPath(_currentFullPath, saveState: true);
+        PlayShuffleAt(_currentIndex - 1);
     }
 
     private void GoNext()
     {
-        if (_shuffle == null || _library == null || _shuffle.Files.Count == 0) return;
+        if (_shuffle == null || _library == null) return;
+        if (_context == PlayContext.OneShot) { ReturnToShuffle(); return; }
+        if (_context == PlayContext.Favorites)
+        {
+            if (_favIndex + 1 < _favorites.Count) PlayFavoriteAt(_favIndex + 1);
+            else ReturnToShuffle();
+            return;
+        }
+        if (_shuffle.Files.Count == 0) return;
         if (_currentIndex + 1 < _shuffle.Files.Count)
         {
-            _currentIndex++;
-            _currentFullPath = _library.ToFull(_shuffle.Files[_currentIndex]);
-            PlayPath(_currentFullPath, saveState: true);
+            PlayShuffleAt(_currentIndex + 1);
         }
         else
         {
@@ -703,9 +833,96 @@ public sealed class MainForm : Form
         }
 
         if (target < 0) { SystemSounds.Beep(); return; }
-        _currentIndex = target;
-        _currentFullPath = _library.ToFull(_shuffle.Files[_currentIndex]);
-        PlayPath(_currentFullPath, saveState: true);
+        // An hour-jump is inherently a shuffle-list move, so it also ends any
+        // favorites/search excursion.
+        PlayShuffleAt(target);
+    }
+
+    // ---- Favorites -----------------------------------------------------------
+
+    private static bool RelEquals(string a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+
+    private int FavoriteIndexOf(string fullPath)
+    {
+        if (_library == null) return -1;
+        var rel = _library.ToRelative(fullPath);
+        return _favorites.FindIndex(f => RelEquals(f, rel));
+    }
+
+    private bool IsFavoritePath(string fullPath) => FavoriteIndexOf(fullPath) >= 0;
+
+    private void SaveFavorites()
+    {
+        if (_library == null) return;
+        try { PlaylistState.SaveFavorites(_library.RootFolder, new FavoritesFile { Files = new List<string>(_favorites) }); }
+        catch (Exception ex) { _errorPanel.Log("Favorites save failed: " + ex.Message); }
+    }
+
+    private void AddFavorite(string fullPath)
+    {
+        if (_library == null) return;
+        var rel = _library.ToRelative(fullPath);
+        if (_favorites.Any(f => RelEquals(f, rel))) return;
+        _favorites.Add(rel);
+        SaveFavorites();
+        RefreshSidebar();
+    }
+
+    private void RemoveFavorite(string fullPath)
+    {
+        if (_library == null) return;
+        RemoveFavoriteRel(_library.ToRelative(fullPath));
+    }
+
+    private void RemoveFavoriteRel(string rel)
+    {
+        int i = _favorites.FindIndex(f => RelEquals(f, rel));
+        if (i < 0) return;
+        _favorites.RemoveAt(i);
+        if (_context == PlayContext.Favorites)
+        {
+            // Leave _favIndex pointing one before the slot that just opened up,
+            // so Next continues with whatever shifted into it.
+            if (i <= _favIndex) _favIndex--;
+        }
+        SaveFavorites();
+        RefreshSidebar();
+    }
+
+    // newIndex is the slot the row should occupy in the list as it looked
+    // BEFORE the move, which is what the drop indicator was drawn against.
+    private void MoveFavorite(string fullPath, int newIndex)
+    {
+        if (_library == null) return;
+        var rel = _library.ToRelative(fullPath);
+        int old = _favorites.FindIndex(f => RelEquals(f, rel));
+        if (old < 0) return;
+        if (newIndex == old || newIndex == old + 1) return;   // dropped where it already is
+
+        string? playingRel = (_context == PlayContext.Favorites && _favIndex >= 0 && _favIndex < _favorites.Count)
+            ? _favorites[_favIndex] : null;
+
+        _favorites.RemoveAt(old);
+        if (newIndex > old) newIndex--;
+        newIndex = Math.Clamp(newIndex, 0, _favorites.Count);
+        _favorites.Insert(newIndex, rel);
+
+        // Follow the file that is playing rather than the slot number.
+        if (playingRel != null) _favIndex = _favorites.FindIndex(f => RelEquals(f, playingRel));
+
+        SaveFavorites();
+        RefreshSidebar();
+    }
+
+    // Drop favorites whose files are no longer in the folder. Only called where
+    // we have just rescanned, so a missing entry really is gone.
+    private void PruneFavoritesToLibrary()
+    {
+        if (_library == null || _favorites.Count == 0) return;
+        var actual = new HashSet<string>(_library.AlphaRelative(), StringComparer.OrdinalIgnoreCase);
+        int before = _favorites.Count;
+        _favorites.RemoveAll(f => !actual.Contains(f));
+        if (_favorites.Count != before) SaveFavorites();
     }
 
     private void OnMediaEnded()
@@ -806,13 +1023,16 @@ public sealed class MainForm : Form
         _shuffle = new ShuffleFile { Seed = seed, CreatedUtc = DateTime.UtcNow, Files = newOrder };
         PlaylistState.SaveShuffle(_library.RootFolder, _shuffle);
         _currentIndex = _shuffle.Files.Count > 0 ? 0 : -1;
-        _currentFullPath = _currentIndex >= 0 ? _library.ToFull(_shuffle.Files[_currentIndex]) : null;
+        // A reshuffle invalidates the spot any excursion was going to return to.
+        _shuffleReturnMs = 0;
+        if (_context == PlayContext.Shuffle)
+            _currentFullPath = _currentIndex >= 0 ? _library.ToFull(_shuffle.Files[_currentIndex]) : null;
         RefreshSidebar();
         _sidebar.EnsureCurrentVisible();
         UpdateNowPlayingLabel();
         UpdateWindowTitle();
-        if (playFirst && _currentFullPath != null)
-            PlayPath(_currentFullPath, saveState: true);
+        if (playFirst && _currentIndex >= 0)
+            PlayShuffleAt(_currentIndex);
         else
             SavePositionState(withPositionMs: false);
     }
@@ -857,7 +1077,12 @@ public sealed class MainForm : Form
     private void PerformRecycle(string fullPath)
     {
         if (!ShellOps.SendToRecycleBin(fullPath))
+        {
             _errorPanel.Log("Recycle Bin delete failed: " + fullPath);
+            return;
+        }
+        // Don't wait for the watcher debounce to notice — the row should go now.
+        if (_library != null) RemoveFavoriteRel(_library.ToRelative(fullPath));
     }
 
     // ---- In-app cut tool -----------------------------------------------------
@@ -887,8 +1112,10 @@ public sealed class MainForm : Form
         }
 
         // Preview reuses the main player, so the target must be what's loaded.
+        // Route it through the tab it was invoked from so a cut started from
+        // Search doesn't quietly hijack the shuffle position.
         if (!string.Equals(_currentFullPath, path, StringComparison.OrdinalIgnoreCase))
-            PlayPath(path, saveState: true);
+            PlayFromSidebar(path);
 
         double fps = 30.0;
         var info = Ffmpeg.Probe(path);
@@ -1023,14 +1250,14 @@ public sealed class MainForm : Form
                     if (ok)
                     {
                         if (!recycledBak) _errorPanel.Log("Cut: backup not sent to Recycle Bin: " + bak);
-                        if (wasCurrent) PlayPath(path, saveState: false);
+                        if (wasCurrent) ReloadCurrentFile(path);
                         _errorPanel.Log("Cut saved (original in Recycle Bin): " + Path.GetFileName(path));
                         if (!win.IsDisposed) win.ReportDone(true, "Saved.");
                     }
                     else
                     {
                         try { if (File.Exists(temp)) File.Delete(temp); } catch { }
-                        if (wasCurrent && File.Exists(path)) PlayPath(path, saveState: false);
+                        if (wasCurrent && File.Exists(path)) ReloadCurrentFile(path);
                         if (!win.IsDisposed) win.ReportDone(false, "Save failed: " + Trunc(err));
                     }
                 }));
@@ -1078,12 +1305,18 @@ public sealed class MainForm : Form
         if (_library == null || _shuffle == null) return;
         try
         {
+            // Always the SHUFFLE position — that is the thing we promise to
+            // remember. During an excursion the playhead we want to keep is the
+            // one we marked when leaving, not whatever is currently playing.
+            long positionMs = _context == PlayContext.Shuffle
+                ? (withPositionMs && _playback.IsPlaying ? _playback.TimeMs : 0)
+                : _shuffleReturnMs;
             var pos = new PositionFile
             {
                 CurrentIndex = _currentIndex,
                 CurrentFileRelative = (_currentIndex >= 0 && _currentIndex < _shuffle.Files.Count)
                     ? _shuffle.Files[_currentIndex] : null,
-                PositionMs = withPositionMs && _playback.IsPlaying ? _playback.TimeMs : 0
+                PositionMs = positionMs
             };
             PlaylistState.SavePosition(_library.RootFolder, pos);
         }
@@ -1095,32 +1328,53 @@ public sealed class MainForm : Form
 
     private void RefreshSidebar()
     {
+        _sidebar.SetFavoritesCount(_favorites.Count);
         if (_library == null || _shuffle == null)
         {
             _sidebar.SetItems(Array.Empty<(string, string, string)>(), null);
             return;
         }
         IEnumerable<(string, string, string)> entries;
-        if (_sidebar.Mode == Sidebar.ViewMode.ShuffleOrder)
+        switch (_sidebar.Mode)
         {
-            entries = _shuffle.Files.Select((rel, i) =>
-                ((i + 1).ToString(), rel, _library.ToFull(rel)));
-        }
-        else
-        {
-            entries = _library.AlphaRelative().Select((rel, i) =>
-                ((i + 1).ToString(), rel, _library.ToFull(rel)));
+            case Sidebar.ViewMode.ShuffleOrder:
+                entries = _shuffle.Files.Select((rel, i) =>
+                    ((i + 1).ToString(), rel, _library.ToFull(rel)));
+                break;
+            case Sidebar.ViewMode.Favorites:
+                entries = _favorites.Select((rel, i) =>
+                    ((i + 1).ToString(), rel, _library.ToFull(rel)));
+                break;
+            default:
+                entries = FilterForSearch(_sidebar.SearchText).Select((rel, i) =>
+                    ((i + 1).ToString(), rel, _library.ToFull(rel)));
+                break;
         }
         _sidebar.SetItems(entries, _currentFullPath);
     }
 
+    // Every whitespace-separated term must appear somewhere in the relative
+    // path, so folder names are searchable too and term order doesn't matter.
+    private IEnumerable<string> FilterForSearch(string query)
+    {
+        if (_library == null) return Array.Empty<string>();
+        var all = _library.AlphaRelative();
+        if (string.IsNullOrWhiteSpace(query)) return all;
+        var terms = query.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (terms.Length == 0) return all;
+        return all.Where(rel => terms.All(t => rel.Contains(t, StringComparison.OrdinalIgnoreCase)));
+    }
+
     private void UpdateNowPlayingLabel()
     {
-        if (_currentFullPath != null)
-            _transport.NowPlayingLabel.Text = Path.GetFileName(_currentFullPath)
-                + (_shuffle != null ? $"    ({_currentIndex + 1:N0} / {_shuffle.Files.Count:N0})" : "");
-        else
-            _transport.NowPlayingLabel.Text = "";
+        if (_currentFullPath == null) { _transport.NowPlayingLabel.Text = ""; return; }
+        string suffix = _context switch
+        {
+            PlayContext.Favorites => $"    (favorite {_favIndex + 1:N0} / {_favorites.Count:N0})",
+            PlayContext.OneShot => "    (search)",
+            _ => _shuffle != null ? $"    ({_currentIndex + 1:N0} / {_shuffle.Files.Count:N0})" : ""
+        };
+        _transport.NowPlayingLabel.Text = Path.GetFileName(_currentFullPath) + suffix;
     }
 
     private void UpdateWindowTitle()
@@ -1684,6 +1938,7 @@ public sealed class MainForm : Form
             if (File.Exists(full)) continue;
             var rel = _library.ToRelative(full);
             RemoveFromShuffle(rel, logWhy: null);
+            RemoveFavoriteRel(rel);
         }
         foreach (var full in adds)
         {
@@ -1702,8 +1957,25 @@ public sealed class MainForm : Form
         _durations?.StartOrUpdate(_library.AlphaList);
     }
 
+    private static Sidebar.ViewMode ParseSidebarTab(string? tab) => tab switch
+    {
+        "search" => Sidebar.ViewMode.Search,
+        "favorites" => Sidebar.ViewMode.Favorites,
+        _ => Sidebar.ViewMode.ShuffleOrder
+    };
+
+    // The sidebar search box needs Space/arrows/M to reach it as text, so the
+    // global transport shortcuts stand down while a text field has focus.
+    private bool FocusIsInTextEntry()
+    {
+        Control? c = this;
+        while (c is ContainerControl cc && cc.ActiveControl != null) c = cc.ActiveControl;
+        return c is TextBoxBase;
+    }
+
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        if (FocusIsInTextEntry()) return base.ProcessCmdKey(ref msg, keyData);
         switch (keyData)
         {
             case Keys.Space: _playback.TogglePause(); return true;
@@ -1732,7 +2004,12 @@ public sealed class MainForm : Form
                 var rb = RestoreBounds;
                 _settings.WindowBounds = new WindowBounds { X = rb.X, Y = rb.Y, W = rb.Width, H = rb.Height, Maximized = WindowState == FormWindowState.Maximized };
             }
-            _settings.SidebarShowShuffleOrder = _sidebar.Mode == Sidebar.ViewMode.ShuffleOrder;
+            _settings.SidebarTab = _sidebar.Mode switch
+            {
+                Sidebar.ViewMode.Search => "search",
+                Sidebar.ViewMode.Favorites => "favorites",
+                _ => "shuffle"
+            };
             _settings.Save();
         }
         catch { }

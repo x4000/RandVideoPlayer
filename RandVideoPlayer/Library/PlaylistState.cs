@@ -23,10 +23,20 @@ public sealed class PositionFile
     [JsonPropertyName("positionMs")] public long PositionMs { get; set; }
 }
 
+// User-curated list, stored alongside the shuffle in the playlist folder so it
+// travels with the media rather than with this machine's settings. Order is
+// meaningful — it is the play order when a favorite is started — and is edited
+// by dragging rows in the sidebar.
+public sealed class FavoritesFile
+{
+    [JsonPropertyName("files")] public List<string> Files { get; set; } = new();
+}
+
 public static class PlaylistState
 {
     public const string ShuffleFileName = ".rvp_shuffle.json";
     public const string PositionFileName = ".rvp_position.json";
+    public const string FavoritesFileName = ".rvp_favorites.json";
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -36,6 +46,7 @@ public static class PlaylistState
 
     public static string ShufflePath(string folder) => Path.Combine(folder, ShuffleFileName);
     public static string PositionPath(string folder) => Path.Combine(folder, PositionFileName);
+    public static string FavoritesPath(string folder) => Path.Combine(folder, FavoritesFileName);
 
     public static ShuffleFile? LoadShuffle(string folder)
     {
@@ -61,6 +72,18 @@ public static class PlaylistState
         catch { return null; }
     }
 
+    public static FavoritesFile? LoadFavorites(string folder)
+    {
+        var path = FavoritesPath(folder);
+        if (!File.Exists(path)) return null;
+        try
+        {
+            using var fs = File.OpenRead(path);
+            return JsonSerializer.Deserialize<FavoritesFile>(fs, JsonOpts);
+        }
+        catch { return null; }
+    }
+
     public static void SaveShuffle(string folder, ShuffleFile data)
     {
         WriteAtomic(ShufflePath(folder), data);
@@ -71,6 +94,12 @@ public static class PlaylistState
     {
         WriteAtomic(PositionPath(folder), data);
         TrySetHidden(PositionPath(folder));
+    }
+
+    public static void SaveFavorites(string folder, FavoritesFile data)
+    {
+        WriteAtomic(FavoritesPath(folder), data);
+        TrySetHidden(FavoritesPath(folder));
     }
 
     private static void WriteAtomic<T>(string finalPath, T data)

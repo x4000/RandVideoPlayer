@@ -24,7 +24,9 @@ public sealed class AppSettings
     [JsonPropertyName("volume")] public int Volume { get; set; } = 80;
     [JsonPropertyName("muted")] public bool Muted { get; set; }
     [JsonPropertyName("sidebarVisible")] public bool SidebarVisible { get; set; } = true;
-    [JsonPropertyName("sidebarShowShuffleOrder")] public bool SidebarShowShuffleOrder { get; set; } = true;
+    // "search" | "shuffle" | "favorites". Superseded the older boolean
+    // sidebarShowShuffleOrder when the sidebar grew past two tabs.
+    [JsonPropertyName("sidebarTab")] public string SidebarTab { get; set; } = "shuffle";
     [JsonPropertyName("errorPanelVisible")] public bool ErrorPanelVisible { get; set; }
     [JsonPropertyName("windowBounds")] public WindowBounds? WindowBounds { get; set; }
 
@@ -65,7 +67,10 @@ public sealed class AppSettings
                     s.Volume = u.Volume;
                     s.Muted = u.Muted;
                     s.SidebarVisible = u.SidebarVisible;
-                    s.SidebarShowShuffleOrder = u.SidebarShowShuffleOrder;
+                    // Older files only had the two-tab boolean; map it forward.
+                    s.SidebarTab = !string.IsNullOrWhiteSpace(u.SidebarTab)
+                        ? u.SidebarTab!
+                        : (u.SidebarShowShuffleOrder ? "shuffle" : "search");
                     s.ErrorPanelVisible = u.ErrorPanelVisible;
                     s.WindowBounds = u.WindowBounds;
                 }
@@ -82,7 +87,8 @@ public sealed class AppSettings
                         if (migrated.Volume.HasValue) s.Volume = migrated.Volume.Value;
                         if (migrated.Muted.HasValue) s.Muted = migrated.Muted.Value;
                         if (migrated.SidebarVisible.HasValue) s.SidebarVisible = migrated.SidebarVisible.Value;
-                        if (migrated.SidebarShowShuffleOrder.HasValue) s.SidebarShowShuffleOrder = migrated.SidebarShowShuffleOrder.Value;
+                        if (migrated.SidebarShowShuffleOrder.HasValue)
+                            s.SidebarTab = migrated.SidebarShowShuffleOrder.Value ? "shuffle" : "search";
                         if (migrated.ErrorPanelVisible.HasValue) s.ErrorPanelVisible = migrated.ErrorPanelVisible.Value;
                         if (migrated.WindowBounds != null) s.WindowBounds = migrated.WindowBounds;
                     }
@@ -110,7 +116,7 @@ public sealed class AppSettings
                 Volume = Volume,
                 Muted = Muted,
                 SidebarVisible = SidebarVisible,
-                SidebarShowShuffleOrder = SidebarShowShuffleOrder,
+                SidebarTab = SidebarTab,
                 ErrorPanelVisible = ErrorPanelVisible,
                 WindowBounds = WindowBounds
             });
@@ -148,7 +154,10 @@ public sealed class AppSettings
         [JsonPropertyName("volume")] public int Volume { get; set; } = 80;
         [JsonPropertyName("muted")] public bool Muted { get; set; }
         [JsonPropertyName("sidebarVisible")] public bool SidebarVisible { get; set; } = true;
+        // Read-only legacy field: written by builds before the sidebar had a
+        // favorites tab. Kept so those settings files still restore a tab.
         [JsonPropertyName("sidebarShowShuffleOrder")] public bool SidebarShowShuffleOrder { get; set; } = true;
+        [JsonPropertyName("sidebarTab")] public string? SidebarTab { get; set; }
         [JsonPropertyName("errorPanelVisible")] public bool ErrorPanelVisible { get; set; }
         [JsonPropertyName("windowBounds")] public WindowBounds? WindowBounds { get; set; }
     }
