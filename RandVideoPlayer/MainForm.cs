@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -66,6 +67,17 @@ public sealed class MainForm : Form
     private Theme _theme = Theme.Dark;
     private readonly ThreadMouseHook _mouseHook = new();
     private CutWindow? _cutWindow;
+    private AudioWindow? _audioWindow;
+    private AudioFx.Settings _audioFx = new();
+
+    // Audio-preview excursion: a short processed excerpt is rendered to %TEMP%
+    // and played on the MAIN player (no second libvlc pipeline — see the cut
+    // tool for the same reasoning). While it runs, the file on screen is NOT a
+    // library file, so auto-advance and position saving have to stand down.
+    private bool _audioPreviewActive;
+    private string? _audioPreviewFile;
+    private long _audioPreviewReturnMs;
+    private int _audioPreviewSeq;
 
     // Display power-state recovery. When the monitors power off (idle timeout
     // or the panel dropping its DP/HDMI link) while the PC stays awake, the GPU
@@ -125,6 +137,7 @@ public sealed class MainForm : Form
     {
         _settings = settings;
         _theme = _settings.DarkMode ? Theme.Dark : Theme.Light;
+        _audioFx = FromPrefs(_settings.AudioFx);
         Text = "RandVideoPlayer";
         MinimumSize = new Size(720, 480);
         StartPosition = FormStartPosition.Manual;
@@ -155,7 +168,15 @@ public sealed class MainForm : Form
         var resetPlayerItem = new ToolStripMenuItem("&Reset Player",
             null, (_, __) => ResetPlayer())
         { ToolTipText = "Rebuild the video/audio pipeline. Use if video or audio stops working after the machine has been idle." };
+        var audioItem = new ToolStripMenuItem("&Audio: Normalize / Compress…",
+            null, (_, __) => { if (_currentFullPath != null) OpenAudioWindow(_currentFullPath); })
+        { ToolTipText = "Peak / loudness normalization and multiband compression for the current file, applied in place with the video stream untouched." };
         playerMenu.DropDownItems.Add(resetPlayerItem);
+        playerMenu.DropDownItems.Add(new ToolStripSeparator());
+        playerMenu.DropDownItems.Add(audioItem);
+        // Grey rather than silently no-op when there is nothing loaded to work on.
+        playerMenu.DropDownOpening += (_, __) =>
+            audioItem.Enabled = _currentFullPath != null && Ffmpeg.IsAvailable;
 
         _menu.Items.AddRange(new ToolStripItem[] { fileMenu, viewMenu, plMenu, playerMenu });
 
@@ -175,6 +196,7 @@ public sealed class MainForm : Form
         _sidebar.RevealRequested += ShellOps.RevealInExplorer;
         _sidebar.DeleteRequested += HandleDeleteFromSidebar;
         _sidebar.CutRequested += OpenCutWindow;
+        _sidebar.AudioRequested += OpenAudioWindow;
         _sidebar.ViewModeChanged += _ => { RefreshSidebar(); _sidebar.EnsureCurrentVisible(); };
         _sidebar.SearchTextChanged += () => { if (_sidebar.Mode == Sidebar.ViewMode.Search) RefreshSidebar(); };
         _sidebar.AddFavoriteRequested += AddFavorite;
@@ -655,6 +677,8 @@ public sealed class MainForm : Form
 
     private void StartPlayback(string fullPath, long resumeMs, bool saveState)
     {
+        // Anything that starts a real file ends an audio preview excursion.
+        if (_audioPreviewActive) EndAudioPreviewState();
         _currentFullPath = fullPath;
         _resumePositionMs = Math.Max(0, resumeMs);
         _resumeApplied = _resumePositionMs <= 0;
@@ -928,7 +952,9 @@ public sealed class MainForm : Form
     private void OnMediaEnded()
     {
         if (IsDisposed) return;
-        BeginInvoke(new Action(GoNext));
+        // A preview clip running out means "preview over", not "track over" —
+        // advancing here would silently move the shuffle on.
+        BeginInvoke(new Action(() => { if (_audioPreviewActive) StopAudioPreview(); else GoNext(); }));
     }
 
     private void OnMediaFailed(string message)
@@ -1168,10 +1194,7 @@ public sealed class MainForm : Form
         {
             try { if (File.Exists(temp)) File.Delete(temp); } catch { }
 
-            void Prog(double f)
-            {
-                try { win.BeginInvoke(new Action(() => { if (!win.IsDisposed) win.ReportProgress(f); })); } catch { }
-            }
+            void Prog(double f) => win.PostToUi(() => win.ReportProgress(f));
 
             bool ok;
             string err;
@@ -1202,41 +1225,44 @@ public sealed class MainForm : Form
             if (!ok)
             {
                 try { if (File.Exists(temp)) File.Delete(temp); } catch { }
-                try { win.BeginInvoke(new Action(() => { if (!win.IsDisposed) win.ReportDone(false, "Failed: " + Trunc(err)); })); } catch { }
+                win.PostToUi(() => win.ReportDone(false, "Failed: " + Trunc(err)));
                 return;
             }
 
-            try { BeginInvoke(new Action(() => FinishCutSwap(path, temp, win))); } catch { }
+            try { BeginInvoke(new Action(() => FinishJobSwap(path, temp, win, ".rvpcut-bak", "Cut"))); } catch { }
         });
     }
 
     // The output is ready and verified. Release libvlc's handle on the file (it
     // keeps the currently-playing file open), THEN swap it in. Mirrors the delete
     // path: Stop, wait for the queued work to drain, then touch the file.
-    private void FinishCutSwap(string path, string temp, CutWindow win)
+    // Shared by the cut tool and the audio tool — only the backup suffix and the
+    // log wording differ.
+    private void FinishJobSwap(string path, string temp, IMediaJobUi ui, string bakSuffix, string label)
     {
-        if (!win.IsDisposed) win.SetBusy(true, "Saving…");
+        if (!ui.IsDisposed) ui.SetBusy(true, "Saving…");
         bool isCurrent = string.Equals(_currentFullPath, path, StringComparison.OrdinalIgnoreCase);
         if (isCurrent)
         {
             try { _playback.Stop(); } catch { }
-            _playback.RunAfterPendingWork(() => BackgroundSwap(path, temp, win, wasCurrent: true));
+            _playback.RunAfterPendingWork(() => BackgroundSwap(path, temp, ui, wasCurrent: true, bakSuffix, label));
         }
         else
         {
-            BackgroundSwap(path, temp, win, wasCurrent: false);
+            BackgroundSwap(path, temp, ui, wasCurrent: false, bakSuffix, label);
         }
     }
 
     // The rename/move can briefly hit a sharing violation while libvlc finishes
     // releasing the handle, so the retry loop runs OFF the UI thread. Only the
     // reload + status report marshal back.
-    private void BackgroundSwap(string path, string temp, CutWindow win, bool wasCurrent)
+    private void BackgroundSwap(string path, string temp, IMediaJobUi ui, bool wasCurrent,
+                                string bakSuffix, string label)
     {
         string dir = Path.GetDirectoryName(path) ?? "";
         string name = Path.GetFileNameWithoutExtension(path);
         string ext = Path.GetExtension(path);
-        string bak = Path.Combine(dir, name + ".rvpcut-bak" + ext);
+        string bak = Path.Combine(dir, name + bakSuffix + ext);
 
         Task.Run(() =>
         {
@@ -1249,16 +1275,16 @@ public sealed class MainForm : Form
                 {
                     if (ok)
                     {
-                        if (!recycledBak) _errorPanel.Log("Cut: backup not sent to Recycle Bin: " + bak);
+                        if (!recycledBak) _errorPanel.Log(label + ": backup not sent to Recycle Bin: " + bak);
                         if (wasCurrent) ReloadCurrentFile(path);
-                        _errorPanel.Log("Cut saved (original in Recycle Bin): " + Path.GetFileName(path));
-                        if (!win.IsDisposed) win.ReportDone(true, "Saved.");
+                        _errorPanel.Log(label + " saved (original in Recycle Bin): " + Path.GetFileName(path));
+                        if (!ui.IsDisposed) ui.ReportDone(true, "Saved.");
                     }
                     else
                     {
                         try { if (File.Exists(temp)) File.Delete(temp); } catch { }
                         if (wasCurrent && File.Exists(path)) ReloadCurrentFile(path);
-                        if (!win.IsDisposed) win.ReportDone(false, "Save failed: " + Trunc(err));
+                        if (!ui.IsDisposed) ui.ReportDone(false, "Save failed: " + Trunc(err));
                     }
                 }));
             }
@@ -1297,12 +1323,302 @@ public sealed class MainForm : Form
         return false;
     }
 
+    // ---- In-app audio mastering ---------------------------------------------
+    // Peak / loudness normalization plus multiband compression, so a quiet track
+    // can be brought in line with the rest of the library without a round trip
+    // through an external editor. The VIDEO stream is copied untouched — only the
+    // audio is re-encoded — so this is fast and visually lossless. The result
+    // goes through exactly the same verify / backup / Recycle-Bin swap as the
+    // cut tool (FinishJobSwap).
+
+    private void OpenAudioWindow(string path)
+    {
+        if (!Ffmpeg.IsAvailable)
+        {
+            MessageBox.Show(this,
+                "ffmpeg was not found on this system.\n\nInstall it (e.g. `winget install Gyan.FFmpeg`) to enable in-app audio processing.",
+                "Audio", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (!File.Exists(path))
+        {
+            MessageBox.Show(this, "File not found:\n" + path, "Audio", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (_audioWindow != null && !_audioWindow.IsDisposed)
+        {
+            _audioWindow.Activate();
+            return;
+        }
+
+        var info = Ffmpeg.Probe(path);
+        if (info != null && !info.HasAudio)
+        {
+            MessageBox.Show(this, "This file has no audio track to process.", "Audio",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (info != null && info.AudioStreams > 1)
+        {
+            var multi = MessageBox.Show(this,
+                "This file has " + info.AudioStreams + " audio tracks.\n\n" +
+                "Processing keeps only the FIRST one; the others would be dropped. Continue?",
+                "Audio", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
+            if (multi != DialogResult.OK) return;
+        }
+
+        // Preview plays through the main player, so the target has to be what is
+        // loaded — the same rule the cut tool follows.
+        if (!string.Equals(_currentFullPath, path, StringComparison.OrdinalIgnoreCase))
+            PlayFromSidebar(path);
+
+        var win = new AudioWindow(path, Path.GetFileName(path), _theme, _audioFx.Clone(), info,
+                                  getTimeMs: () => _playback.TimeMs);
+        _audioWindow = win;
+        win.SettingsChanged += s => { _audioFx = s; _settings.AudioFx = ToPrefs(s); };
+        win.ApplyConfirmed += req => PerformAudioProcess(path, req, win);
+        win.PreviewRequested += req => StartAudioPreview(path, req, win);
+        win.PreviewStopRequested += StopAudioPreview;
+        win.FormClosed += (_, __) =>
+        {
+            if (ReferenceEquals(_audioWindow, win)) _audioWindow = null;
+            if (_audioPreviewActive) StopAudioPreview();
+        };
+        win.Show(this);
+    }
+
+    private void PerformAudioProcess(string path, AudioRequest req, AudioWindow win)
+    {
+        if (!req.Settings.ChangesAnything) return;
+        // The original file — not a preview clip — has to be what is loaded and
+        // what gets replaced.
+        if (_audioPreviewActive) StopAudioPreview();
+
+        var confirm = MessageBox.Show(this,
+            "Replace the original with the processed version?\n\n" + Path.GetFileName(path) + "\n\n" +
+            DescribeAudioJob(req.Settings) + "\n\n" +
+            "Video is copied untouched; only the audio is re-encoded.\n" +
+            "The original is moved to the Recycle Bin as a backup.",
+            "Apply audio processing", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+        if (confirm != DialogResult.OK) return;
+
+        string dir = Path.GetDirectoryName(path) ?? "";
+        string name = Path.GetFileNameWithoutExtension(path);
+        string ext = Path.GetExtension(path);
+        string temp = Path.Combine(dir, name + ".rvpaudio-tmp" + ext);
+
+        var settings = req.Settings;
+        var measured = req.Measured;
+        win.SetBusy(true, "Preparing…");
+
+        Task.Run(() =>
+        {
+            void Prog(double f) => win.PostToUi(() => win.ReportProgress(f));
+
+            try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+
+            var info = Ffmpeg.Probe(path);
+            double dur = info?.DurationSec ?? 0;
+
+            // The window normally has a fresh measurement already; re-measure if it
+            // does not, because the normalizer's second pass depends on it.
+            if (measured == null || !measured.Ok)
+            {
+                win.PostToUi(() => win.SetBusy(true, "Analyzing…"));
+                measured = AudioFx.Analyze(path, settings, dur, f => Prog(f * 0.35), CancellationToken.None);
+                if (!measured.Ok && settings.Normalize != AudioFx.NormalizeMode.None)
+                {
+                    string why = measured.Error ?? "analysis failed";
+                    win.PostToUi(() => win.ReportDone(false, "Failed: " + Trunc(why)));
+                    return;
+                }
+            }
+
+            bool ok = AudioFx.Apply(path, temp, settings, measured, info, dur,
+                                    f => Prog(0.35 + f * 0.65), CancellationToken.None, out string err);
+
+            if (ok)
+            {
+                var v = Ffmpeg.Probe(temp);
+                bool sane = v != null
+                            && v.HasAudio
+                            && (info == null || !info.HasVideo || v.HasVideo)
+                            && v.DurationSec > 0.05
+                            && (dur <= 0 || Math.Abs(v.DurationSec - dur) <= Math.Max(1.0, dur * 0.02));
+                if (!sane)
+                {
+                    ok = false;
+                    err = "Output verification failed (missing stream or unexpected duration).";
+                }
+            }
+
+            if (!ok)
+            {
+                try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+                win.PostToUi(() => win.ReportDone(false, "Failed: " + Trunc(err)));
+                return;
+            }
+
+            try { BeginInvoke(new Action(() => FinishJobSwap(path, temp, win, ".rvpaudio-bak", "Audio"))); } catch { }
+        });
+    }
+
+    private static string DescribeAudioJob(AudioFx.Settings s)
+    {
+        var parts = new List<string>();
+        if (s.HighPass) parts.Add("rumble filter");
+        if (s.Compressor != AudioFx.CompressorStyle.None) parts.Add(AudioFx.StyleName(s.Compressor));
+        parts.Add(s.Normalize switch
+        {
+            AudioFx.NormalizeMode.Peak => "peak normalize to " + s.PeakTargetDb.ToString("0.##", CultureInfo.InvariantCulture) + " dBFS",
+            AudioFx.NormalizeMode.Loudness => "loudness normalize to " + s.LoudnessTargetLufs.ToString("0.#", CultureInfo.InvariantCulture) + " LUFS",
+            AudioFx.NormalizeMode.Dynamic => "dynamic leveller",
+            _ => "no level change",
+        });
+        if (s.Limiter) parts.Add("limiter at " + s.LimiterCeilingDb.ToString("0.##", CultureInfo.InvariantCulture) + " dBFS");
+        return string.Join("  ->  ", parts);
+    }
+
+    // ---- audio preview excursion --------------------------------------------
+
+    private void StartAudioPreview(string path, AudioRequest req, AudioWindow win)
+    {
+        if (_audioPreviewActive) StopAudioPreview();
+
+        var info = Ffmpeg.Probe(path);
+        double dur = info?.DurationSec ?? 0;
+        const double PreviewSec = 20.0;
+        double start = req.StartMs / 1000.0;
+        // Back off from the very end so a preview started near the outro still has
+        // something to play.
+        if (dur > PreviewSec) start = Math.Clamp(start, 0, dur - PreviewSec);
+        else start = 0;
+
+        string file = Path.Combine(Path.GetTempPath(),
+            "rvp-audio-preview-" + Environment.ProcessId + "-" + (++_audioPreviewSeq) + ".mp4");
+
+        var settings = req.Settings;
+        var measured = req.Measured;
+        long backTo = req.StartMs;
+        win.SetBusy(true, "Rendering preview…");
+
+        Task.Run(() =>
+        {
+            bool ok = AudioFx.RenderPreview(path, file, start, PreviewSec, settings, measured, info,
+                                            CancellationToken.None, out string err);
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    if (win.IsDisposed) { DeleteTempLater(file); return; }
+                    if (!ok || !File.Exists(file))
+                    {
+                        DeleteTempLater(file);
+                        win.NotifyPreviewEnded();
+                        win.ReportDone(false, "Preview failed: " + Trunc(err));
+                        return;
+                    }
+                    _audioPreviewActive = true;
+                    _audioPreviewFile = file;
+                    _audioPreviewReturnMs = backTo;
+                    // A resume-seek still pending from startup would land past the
+                    // end of a 20-second clip; the excursion supplies its own start.
+                    _resumePositionMs = 0;
+                    _resumeApplied = true;
+                    _playback.PlayAt(file, 0);
+                    win.SetBusy(false, "Previewing " + (int)PreviewSec + "s from " + FormatMs((long)(start * 1000))
+                                       + " — processed. Press \"Back to original\" to return.");
+                }));
+            }
+            catch { DeleteTempLater(file); }
+        });
+    }
+
+    private void StopAudioPreview()
+    {
+        if (!_audioPreviewActive) return;
+        long back = _audioPreviewReturnMs;
+        string? path = _currentFullPath;
+        EndAudioPreviewState();
+        if (path != null && File.Exists(path)) StartPlayback(path, back, saveState: false);
+    }
+
+    // Clears the excursion flags and disposes the temp clip. Deliberately does NOT
+    // touch playback: StartPlayback calls this when the user navigates away
+    // mid-preview, at which point it has already decided what to play.
+    private void EndAudioPreviewState()
+    {
+        _audioPreviewActive = false;
+        string? file = _audioPreviewFile;
+        _audioPreviewFile = null;
+        if (_audioWindow != null && !_audioWindow.IsDisposed) _audioWindow.NotifyPreviewEnded();
+        if (file != null) DeleteTempLater(file);
+    }
+
+    // libvlc may still be releasing its handle on the clip we just moved off, so
+    // retry off the UI thread rather than leaking a file on the first failure.
+    private static void DeleteTempLater(string file)
+    {
+        Task.Run(() =>
+        {
+            for (int i = 0; i < 20; i++)
+            {
+                try { if (!File.Exists(file)) return; File.Delete(file); return; }
+                catch { Thread.Sleep(150); }
+            }
+        });
+    }
+
+    private static string FormatMs(long ms)
+    {
+        var ts = TimeSpan.FromMilliseconds(Math.Max(0, ms));
+        return ts.TotalHours >= 1
+            ? string.Format(CultureInfo.InvariantCulture, "{0:0}:{1:00}:{2:00}", (int)ts.TotalHours, ts.Minutes, ts.Seconds)
+            : string.Format(CultureInfo.InvariantCulture, "{0:0}:{1:00}", (int)ts.TotalMinutes, ts.Seconds);
+    }
+
+    // ---- audio settings <-> on-disk prefs ------------------------------------
+
+    private static AudioFx.Settings FromPrefs(AudioFxPrefs p)
+    {
+        var s = new AudioFx.Settings
+        {
+            PeakTargetDb = p.PeakTargetDb,
+            LoudnessTargetLufs = p.LoudnessTargetLufs,
+            TruePeakDb = p.TruePeakDb,
+            LoudnessRangeLu = p.LoudnessRangeLu,
+            HighPass = p.HighPass,
+            Limiter = p.Limiter,
+            LimiterCeilingDb = p.LimiterCeilingDb,
+            AudioBitrateKbps = p.AudioBitrateKbps,
+        };
+        if (Enum.TryParse<AudioFx.NormalizeMode>(p.Normalize, true, out var n)) s.Normalize = n;
+        if (Enum.TryParse<AudioFx.CompressorStyle>(p.Compressor, true, out var c)) s.Compressor = c;
+        return s;
+    }
+
+    private static AudioFxPrefs ToPrefs(AudioFx.Settings s) => new()
+    {
+        Normalize = s.Normalize.ToString(),
+        PeakTargetDb = s.PeakTargetDb,
+        LoudnessTargetLufs = s.LoudnessTargetLufs,
+        TruePeakDb = s.TruePeakDb,
+        LoudnessRangeLu = s.LoudnessRangeLu,
+        Compressor = s.Compressor.ToString(),
+        HighPass = s.HighPass,
+        Limiter = s.Limiter,
+        LimiterCeilingDb = s.LimiterCeilingDb,
+        AudioBitrateKbps = s.AudioBitrateKbps,
+    };
+
     private static string Trunc(string s)
         => string.IsNullOrEmpty(s) ? "unknown error" : (s.Length > 300 ? s.Substring(0, 300) + "…" : s);
 
     private void SavePositionState(bool withPositionMs)
     {
         if (_library == null || _shuffle == null) return;
+        // The playhead currently belongs to a temp preview clip, not to the track.
+        if (_audioPreviewActive) return;
         try
         {
             // Always the SHUFFLE position — that is the thing we promise to
@@ -1566,6 +1882,7 @@ public sealed class MainForm : Form
         _errorPanel.ApplyTheme(_theme);
         _videoHost.BackColor = Color.Black;
         if (_cutWindow != null && !_cutWindow.IsDisposed) _cutWindow.ApplyTheme(_theme);
+        if (_audioWindow != null && !_audioWindow.IsDisposed) _audioWindow.ApplyTheme(_theme);
 
         // Native chrome (title bar + scrollbars) — Windows-only dark-mode hooks.
         if (IsHandleCreated)
@@ -2013,6 +2330,7 @@ public sealed class MainForm : Form
             _settings.Save();
         }
         catch { }
+        try { if (_audioPreviewFile != null) DeleteTempLater(_audioPreviewFile); } catch { }
         try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
         try { UnregisterDisplayNotify(); } catch { }
         try { _uiTimer.Stop(); _uiTimer.Dispose(); } catch { }

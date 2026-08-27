@@ -73,6 +73,10 @@ public static class Ffmpeg
         public int Height;
         public string? PixFmt;
         public double Fps = 30.0;
+        public int AudioStreams;
+        public int SampleRate;
+        public int Channels;
+        public int AudioBitrateKbps;
         public bool HasVideo => !string.IsNullOrEmpty(VideoCodec);
         public bool HasAudio => !string.IsNullOrEmpty(AudioCodec);
     }
@@ -84,6 +88,7 @@ public static class Ffmpeg
         if (probe == null) return null;
         var args = "-v error -show_entries format=duration"
                  + ":stream=index,codec_type,codec_name,width,height,pix_fmt,avg_frame_rate"
+                 + ",sample_rate,channels,bit_rate"
                  + " -of json " + Quote(input);
         if (!RunToString(probe, args, out var json)) return null;
 
@@ -113,9 +118,19 @@ public static class Ffmpeg
                         if (s.TryGetProperty("avg_frame_rate", out var fr))
                             info.Fps = ParseRate(fr.GetString());
                     }
-                    else if (type == "audio" && info.AudioCodec == null)
+                    else if (type == "audio")
                     {
+                        info.AudioStreams++;
+                        if (info.AudioCodec != null) continue;
                         info.AudioCodec = codec;
+                        if (s.TryGetProperty("sample_rate", out var sr)
+                            && int.TryParse(sr.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var sri))
+                            info.SampleRate = sri;
+                        if (s.TryGetProperty("channels", out var ch) && ch.ValueKind == JsonValueKind.Number)
+                            info.Channels = ch.GetInt32();
+                        if (s.TryGetProperty("bit_rate", out var br)
+                            && long.TryParse(br.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var bri) && bri > 0)
+                            info.AudioBitrateKbps = (int)Math.Round(bri / 1000.0);
                     }
                 }
             }
@@ -207,8 +222,8 @@ public static class Ffmpeg
 
     // ---- process plumbing ----------------------------------------------------
 
-    private static string Quote(string p) => "\"" + p + "\"";
-    private static string Sec(double s) => s.ToString("F6", CultureInfo.InvariantCulture);
+    internal static string Quote(string p) => "\"" + p + "\"";
+    internal static string Sec(double s) => s.ToString("F6", CultureInfo.InvariantCulture);
 
     // Runs ffprobe and returns its stdout as a string. Returns false on non-zero exit.
     private static bool RunToString(string exe, string args, out string stdout)
@@ -241,8 +256,15 @@ public static class Ffmpeg
     // Runs ffmpeg, streaming -progress from stdout to report a 0..1 fraction, and
     // keeping a tail of stderr for error reporting. Kills the process if the
     // cancellation token fires. Returns true on exit code 0.
-    private static bool RunFfmpeg(string args, double totalSec, Action<double>? progress,
-                                  CancellationToken ct, out string error)
+    internal static bool RunFfmpeg(string args, double totalSec, Action<double>? progress,
+                                   CancellationToken ct, out string error)
+        => RunFfmpeg(args, totalSec, progress, ct, null, out error);
+
+    // <paramref name="fullStderr"/>, when supplied, accumulates the whole stderr
+    // stream (capped) — the audio analysis pass reads its loudnorm JSON / astats
+    // numbers from there. Otherwise only a 20-line tail is kept for errors.
+    internal static bool RunFfmpeg(string args, double totalSec, Action<double>? progress,
+                                   CancellationToken ct, StringBuilder? fullStderr, out string error)
     {
         error = "";
         var exe = FfmpegPath;
@@ -272,6 +294,10 @@ public static class Ffmpeg
                 {
                     stderrTail.Enqueue(e.Data);
                     while (stderrTail.Count > 20) stderrTail.Dequeue();
+                    // Cap the full capture so a file that spews decode warnings
+                    // can't balloon memory.
+                    if (fullStderr != null && fullStderr.Length < 262144)
+                        fullStderr.AppendLine(e.Data);
                 }
             };
 

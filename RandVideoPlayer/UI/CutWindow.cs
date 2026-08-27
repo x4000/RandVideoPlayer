@@ -24,7 +24,7 @@ public sealed class CutRequest
 /// hardened libvlc pipeline. The window only collects In/Out + mode and hands a
 /// <see cref="CutRequest"/> back to MainForm.
 /// </summary>
-public sealed class CutWindow : Form
+public sealed class CutWindow : Form, IMediaJobUi
 {
     private readonly Func<long> _getTimeMs;
     private readonly Func<long> _getLengthMs;
@@ -331,7 +331,12 @@ public sealed class CutWindow : Form
         CutConfirmed?.Invoke(new CutRequest { InMs = inMs, OutMs = outMs, Reencode = _reencode.Checked });
     }
 
-    // ---- called by MainForm (UI thread) to reflect progress -----------------
+    // ---- IMediaJobUi: called by MainForm to reflect progress ----------------
+
+    public void PostToUi(Action action)
+    {
+        try { if (!IsDisposed) BeginInvoke(action); } catch { }
+    }
 
     public void SetBusy(bool busy, string status)
     {

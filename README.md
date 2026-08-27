@@ -50,7 +50,8 @@ UI deliberately minimal compared to VLC itself.
   after the currently-playing track.
 - **Sidebar** with toggle between alphabetical view and shuffle-order view.
   Current track is highlighted. Double-click to jump. Right-click menu to
-  Reveal in Explorer, Delete (Recycle Bin), or Cut… (lossless).
+  Reveal in Explorer, Delete (Recycle Bin), Cut… (lossless), or
+  Normalize / compress audio…
 - **In-app lossless cut tool.** A pop-out trim window (right-click ▸ Cut…)
   with a full-length In/Out bar plus a zoomed "magnifier" scrubber for
   frame-precise seeking. Lossless stream-copy cutting by default (zero
@@ -58,6 +59,26 @@ UI deliberately minimal compared to VLC itself.
   re-encode. Preview helpers: play-from-In, preview-end, and stop-at-Out.
   Saves in place, moving the original to the Recycle Bin as a backup.
   Requires a local `ffmpeg`/`ffprobe`.
+- **In-app audio mastering.** A pop-out window (right-click ▸ Normalize /
+  compress audio…, or Player ▸ Audio) that replaces the round trip through an
+  external editor. Measures the file (integrated LUFS, sample peak, true peak,
+  loudness range), then applies any of:
+  - **Peak normalization** — Audition-style "normalize to 0.1 dB", in dBFS or
+    as a percentage of full scale.
+  - **Loudness normalization** — EBU R128 / ITU-R BS.1770 two-pass `loudnorm`
+    to a LUFS target (default −16 LUFS, true peak −1 dBTP). This is the mode
+    that makes separate files sit at the same perceived level.
+  - **Dynamic leveller** — moving-window normalization for material whose
+    level wanders within the file.
+  - **Multiband compression** in six styles (gentle glue, broadcast, voice,
+    punchy, aggressive, single-band), built from `acrossover` + per-band
+    `acompressor`, plus an optional rumble filter and safety limiter.
+  Chain order is high-pass → compressor → normalizer → limiter, with the
+  normalizer last so it always has the final say on level. The **video stream
+  is copied untouched** — only the audio is re-encoded — so a four-minute file
+  processes in a couple of seconds. A 20-second processed excerpt can be
+  previewed in the main window before committing. Saves in place through the
+  same verify / backup / Recycle Bin flow as the cut tool.
 - **Header stats** show file count and aggregate total duration, computed in
   a background thread and cached in a hidden `.rvp_durations.json` per
   folder.
@@ -111,7 +132,7 @@ opened folder is re-opened automatically. Use **File → Open Folder** or
   shuffle order. Works when the cursor is over the app window.
 - **Double-click in sidebar** — play that file.
 - **Right-click in sidebar** — Play / Reveal in Explorer / Delete (Recycle
-  Bin) / Cut… (lossless).
+  Bin) / Cut… (lossless) / Normalize / compress audio…
 - **Scroll wheel over volume slider** — adjust volume.
 
 ### Keyboard
@@ -169,11 +190,15 @@ Stored in `%AppData%\ArcenSettings\RandVideoPlayer\`:
 
 ## Third-party integrations
 
-- **ffmpeg / ffprobe** — power the in-app cut tool. Auto-detected from the
-  winget "Links" shim directory, common install paths, and `PATH`. The
-  sidebar's "Cut…" entry is greyed when they are absent. Lossless cuts use
+- **ffmpeg / ffprobe** — power the in-app cut and audio tools. Auto-detected
+  from the winget "Links" shim directory, common install paths, and `PATH`.
+  The sidebar's "Cut…" and "Normalize / compress audio…" entries are greyed
+  when they are absent. Lossless cuts use
   `ffmpeg -ss <keyframe> -i in -t <dur> -c copy`; the optional frame-accurate
-  mode re-encodes the selection at CRF 18.
+  mode re-encodes the selection at CRF 18. Audio processing measures with
+  `astats` + `loudnorm=print_format=json` in one pass, then re-encodes only
+  the audio (`-map 0 -map -0:a? -map "[out]" -c copy -c:a <encoder>`), so the
+  video, subtitles, chapters and metadata are stream-copied.
 
 ---
 
@@ -190,8 +215,9 @@ Stored in `%AppData%\ArcenSettings\RandVideoPlayer\`:
   sidebar, error panel, icon buttons.
 - `UI/` — theme palettes, dark-mode chrome helpers (DWM title bar +
   UxTheme scrollbars), low-level mouse hook.
-- `Integrations/` — shell-level helpers (Recycle Bin send, Explorer reveal)
-  and ffmpeg/ffprobe detection + cut execution.
+- `Integrations/` — shell-level helpers (Recycle Bin send, Explorer reveal),
+  ffmpeg/ffprobe detection + cut execution (`Ffmpeg.cs`), and the audio
+  measurement / filter-chain builder (`AudioFx.cs`).
 - `AppState/AppSettings.cs` — two-file settings persistence with migration
   from older unified format.
 

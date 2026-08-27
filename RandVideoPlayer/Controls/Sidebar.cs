@@ -23,6 +23,7 @@ public sealed class Sidebar : UserControl, IThemedControl
     public event Action<string>? RevealRequested;
     public event Action<string>? DeleteRequested;
     public event Action<string>? CutRequested;
+    public event Action<string>? AudioRequested;
     public event Action<ViewMode>? ViewModeChanged;
     public event Action? SearchTextChanged;
     public event Action<string>? AddFavoriteRequested;
@@ -199,11 +200,12 @@ public sealed class Sidebar : UserControl, IThemedControl
         var miAddFav = new ToolStripMenuItem("Add to Favorites");
         var miRemoveFav = new ToolStripMenuItem("Remove from Favorites");
         var miCut = new ToolStripMenuItem("Cut… (lossless)");
+        var miAudio = new ToolStripMenuItem("Normalize / compress audio…");
         menu.Items.AddRange(new ToolStripItem[]
         {
             miPlay, miReveal, miDelete,
             new ToolStripSeparator(), miAddFav, miRemoveFav,
-            new ToolStripSeparator(), miCut
+            new ToolStripSeparator(), miCut, miAudio
         });
         menu.Opening += (s, e) =>
         {
@@ -215,6 +217,10 @@ public sealed class Sidebar : UserControl, IThemedControl
             miRemoveFav.Visible = has && isFav;
             miCut.Enabled = has && Ffmpeg.IsAvailable;
             miCut.Text = Ffmpeg.IsAvailable ? "Cut… (lossless)" : "Cut… (ffmpeg not found)";
+            miAudio.Enabled = has && Ffmpeg.IsAvailable;
+            miAudio.Text = Ffmpeg.IsAvailable
+                ? "Normalize / compress audio…"
+                : "Normalize / compress audio… (ffmpeg not found)";
             if (!has) e.Cancel = true;
         };
         string? SelectedPath() => List.SelectedItems.Count > 0 && List.SelectedItems[0].Tag is string s ? s : null;
@@ -224,6 +230,7 @@ public sealed class Sidebar : UserControl, IThemedControl
         miAddFav.Click += (_, __) => { var p = SelectedPath(); if (p != null) AddFavoriteRequested?.Invoke(p); };
         miRemoveFav.Click += (_, __) => { var p = SelectedPath(); if (p != null) RemoveFavoriteRequested?.Invoke(p); };
         miCut.Click += (_, __) => { var p = SelectedPath(); if (p != null) CutRequested?.Invoke(p); };
+        miAudio.Click += (_, __) => { var p = SelectedPath(); if (p != null) AudioRequested?.Invoke(p); };
         List.ContextMenuStrip = menu;
 
         Controls.Add(List);

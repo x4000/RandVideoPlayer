@@ -29,6 +29,9 @@ public sealed class AppSettings
     [JsonPropertyName("sidebarTab")] public string SidebarTab { get; set; } = "shuffle";
     [JsonPropertyName("errorPanelVisible")] public bool ErrorPanelVisible { get; set; }
     [JsonPropertyName("windowBounds")] public WindowBounds? WindowBounds { get; set; }
+    // Last-used audio mastering settings, so the Audio window re-opens on the
+    // targets the user has settled on rather than the factory defaults.
+    [JsonPropertyName("audioFx")] public AudioFxPrefs AudioFx { get; set; } = new();
 
     public static string SettingsDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -73,6 +76,7 @@ public sealed class AppSettings
                         : (u.SidebarShowShuffleOrder ? "shuffle" : "search");
                     s.ErrorPanelVisible = u.ErrorPanelVisible;
                     s.WindowBounds = u.WindowBounds;
+                    if (u.AudioFx != null) s.AudioFx = u.AudioFx;
                 }
             }
             else if (File.Exists(CorePath))
@@ -118,7 +122,8 @@ public sealed class AppSettings
                 SidebarVisible = SidebarVisible,
                 SidebarTab = SidebarTab,
                 ErrorPanelVisible = ErrorPanelVisible,
-                WindowBounds = WindowBounds
+                WindowBounds = WindowBounds,
+                AudioFx = AudioFx
             });
         }
         catch { }
@@ -160,6 +165,7 @@ public sealed class AppSettings
         [JsonPropertyName("sidebarTab")] public string? SidebarTab { get; set; }
         [JsonPropertyName("errorPanelVisible")] public bool ErrorPanelVisible { get; set; }
         [JsonPropertyName("windowBounds")] public WindowBounds? WindowBounds { get; set; }
+        [JsonPropertyName("audioFx")] public AudioFxPrefs? AudioFx { get; set; }
     }
 
     // Used only to read the old unified format when migrating forward.
@@ -172,6 +178,25 @@ public sealed class AppSettings
         [JsonPropertyName("errorPanelVisible")] public bool? ErrorPanelVisible { get; set; }
         [JsonPropertyName("windowBounds")] public WindowBounds? WindowBounds { get; set; }
     }
+}
+
+/// <summary>
+/// On-disk shape of the audio mastering defaults. Deliberately primitives rather
+/// than the Integrations.AudioFx types so the settings file stays independent of
+/// the processing code (enums are stored by name and re-parsed leniently).
+/// </summary>
+public sealed class AudioFxPrefs
+{
+    [JsonPropertyName("normalize")] public string Normalize { get; set; } = "Loudness";
+    [JsonPropertyName("peakTargetDb")] public double PeakTargetDb { get; set; } = -0.1;
+    [JsonPropertyName("loudnessTargetLufs")] public double LoudnessTargetLufs { get; set; } = -16.0;
+    [JsonPropertyName("truePeakDb")] public double TruePeakDb { get; set; } = -1.0;
+    [JsonPropertyName("loudnessRangeLu")] public double LoudnessRangeLu { get; set; } = 11.0;
+    [JsonPropertyName("compressor")] public string Compressor { get; set; } = "None";
+    [JsonPropertyName("highPass")] public bool HighPass { get; set; }
+    [JsonPropertyName("limiter")] public bool Limiter { get; set; } = true;
+    [JsonPropertyName("limiterCeilingDb")] public double LimiterCeilingDb { get; set; } = -1.0;
+    [JsonPropertyName("audioBitrateKbps")] public int AudioBitrateKbps { get; set; }
 }
 
 public sealed class WindowBounds
